@@ -20,10 +20,24 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.backends import default_backend
 
 
-VERSION = '0.0.8'
+VERSION = '0.0.9'
 END_TOKEN = b'|[-_-]|'
 SPLIT_TOKEN = b'|(---)|'
 SPLIT_TOKEN2 = b'|{***}|'
+
+# Two markers that ride inside an existing field rather than adding one, so a
+# peer that predates them is never handed a frame shaped differently than it
+# expects -- it just sees a payload it does not recognise.
+#
+# HANDLER_ERROR_TOKEN prefixes the response payload of a request whose handler
+# raised, so the client can tell a failure from an ordinary reply.
+HANDLER_ERROR_TOKEN = b'|[bisocket-handler-error]|'
+# HANDSHAKE_ERROR_TOKEN prefixes a *plaintext* frame the server writes back when
+# it could not read a client's handshake at all. It has to be readable by a peer
+# that disagrees about the encryption mode, which is exactly the case it reports,
+# so it cannot itself be encrypted.
+HANDSHAKE_ERROR_TOKEN = b'|[bisocket-handshake-error]|'
+
 LENGTH_OF_END_TOKEN = len(END_TOKEN)
 RECV_SIZE = 65536
 CLIENT_TEARDOWN_TIMEOUT = 30.0
@@ -42,6 +56,12 @@ ENCRYPTION_OFF = 'off'         # no encryption at all
 
 ENCRYPTION_MODES = (ENCRYPTION_SECURE, ENCRYPTION_FASTER, ENCRYPTION_OFF)
 
+# Which of a client's two sockets a lifecycle callback is being called for.
+# `None` means the handshake failed before the socket said which one it was.
+CONNECTION_SEND = 'send'
+CONNECTION_RECEIVE = 'receive'
+CONNECTION_TYPES = (CONNECTION_SEND, CONNECTION_RECEIVE)
+
 _ENCRYPTION_ALIASES = {
     ENCRYPTION_SECURE: ENCRYPTION_SECURE,
     'on': ENCRYPTION_SECURE, 'true': ENCRYPTION_SECURE, '1': ENCRYPTION_SECURE,
@@ -58,6 +78,101 @@ _ENCRYPTION_ALIASES = {
 
 class ConnectionClosed(ConnectionError):
     """The peer went away before a complete frame arrived."""
+
+
+class EncryptionMismatch(ValueError):
+    """A frame could not be read under this peer's encryption mode.
+
+    Subclasses ValueError because that is what the codecs raised before this
+    existed, so `except ValueError` in caller code keeps working.
+    """
+
+
+class MissingCryptoKey(RuntimeError):
+    """require_key was asked for and $CRYPTO_KEY is not set."""
+
+
+@dataclass
+class HandlerErrorInfo:
+    """What a server-side handler failure looked like, as seen by the client."""
+
+    type: str
+    message: str
+    method: str | None = None
+    traceback: str | None = None
+
+    def __str__(self) -> str:
+        where = f' handling {self.method!r}' if self.method else ''
+        return f'{self.type}{where}: {self.message}'
+
+
+class HandlerError(RuntimeError):
+    """Raised by Message.raise_for_error() for a reply that reports a failure."""
+
+    def __init__(self, info: HandlerErrorInfo):
+        super().__init__(str(info))
+        self.info = info
+
+
+def encode_handler_error(
+        exc: BaseException,
+        method: str | None = None,
+        include_traceback: bool = False,
+    ) -> bytes:
+    """Build the payload of an error reply for a handler that raised."""
+    payload = {
+        'error': 'handler_error',
+        'type': type(exc).__name__,
+        'message': str(exc),
+        'method': method,
+    }
+    if include_traceback:
+        payload['traceback'] = ''.join(
+            traceback.format_exception(type(exc), exc, exc.__traceback__)
+        )
+    return HANDLER_ERROR_TOKEN + json.dumps(payload).encode()
+
+
+def _handshake_error_frame(server_mode: str) -> bytes:
+    """Build the plaintext frame that reports an unreadable handshake.
+
+    Deliberately not encrypted: the peer this is aimed at is one that cannot read
+    frames written in `server_mode`, which is the whole point of the message.
+    """
+    return HANDSHAKE_ERROR_TOKEN + json.dumps({
+        'error': 'handshake_failed',
+        'server_encryption': server_mode,
+        'message': _mismatch_message(server_mode),
+    }).encode()
+
+
+def check_handshake_error(frame: bytes, client_mode: str) -> None:
+    """Raise if `frame` is a server's plaintext report of an unreadable handshake.
+
+    Called before any attempt to decrypt, because a frame that reports an
+    encryption disagreement is by definition one this peer cannot decrypt.
+    """
+    if not frame.startswith(HANDSHAKE_ERROR_TOKEN):
+        return
+
+    server_mode = None
+    try:
+        server_mode = json.loads(frame[len(HANDSHAKE_ERROR_TOKEN):].decode()).get('server_encryption')
+    except Exception:
+        pass
+
+    if server_mode and server_mode != client_mode:
+        raise EncryptionMismatch(
+            f'the server could not read this connection: the server is using '
+            f'encryption {server_mode!r} and this client is using {client_mode!r}. '
+            f'Both ends must use the same mode -- set encryption= to the same '
+            f'value on Client and Server, or set $BISOCKET_ENCRYPTION for both.'
+        )
+    raise EncryptionMismatch(
+        f'the server rejected this connection: it could not read the handshake '
+        f'frame this client sent as {client_mode!r}. '
+        + _mismatch_message(server_mode or client_mode)
+    )
 
 
 # A single recv() can return more than one frame, and the bytes past the first
@@ -93,13 +208,42 @@ def receive(conn: socket.socket) -> bytes:
 _crypto_key_warned = False
 
 
-def get_crypto_key() -> str:
-    """Read CRYPTO_KEY, warning once if the insecure development default is used."""
+def resolve_require_key(require_key: 'bool | None' = None) -> bool:
+    """Normalise require_key, falling back to $BISOCKET_REQUIRE_KEY.
+
+    None means 'not specified here', so the environment decides; unset
+    environment means the historical behaviour of warning rather than failing.
+    """
+    if require_key is not None:
+        return bool(require_key)
+
+    value = os.environ.get('BISOCKET_REQUIRE_KEY')
+    if value is None:
+        return False
+    return value.strip().lower() in ('1', 'true', 'yes', 'on', 'require', 'required')
+
+
+def get_crypto_key(require: bool = False) -> str:
+    """Read CRYPTO_KEY, warning once if the insecure development default is used.
+
+    With `require` set, a missing key raises MissingCryptoKey instead. A warning
+    in a long-running server's log is easy to miss, and the failure mode without
+    it is silent: the service comes up and runs on a publicly known key.
+    """
     global _crypto_key_warned
 
     key = os.environ.get('CRYPTO_KEY')
     if key:
         return key
+
+    if require:
+        raise MissingCryptoKey(
+            'CRYPTO_KEY is not set and require_key is on, so bisocket will not '
+            'fall back to the built-in insecure key. Set CRYPTO_KEY in the '
+            "environment, or pass require_key=False to accept the default. "
+            '(require_key has no effect when encryption is off, since no key is '
+            'used at all in that mode.)'
+        )
 
     if not _crypto_key_warned:
         _crypto_key_warned = True
@@ -320,7 +464,7 @@ class SecureCodec:
         try:
             encrypted_data = EncryptedData.from_bytes(data)
         except Exception as e:
-            raise ValueError(_mismatch_message(self.mode)) from e
+            raise EncryptionMismatch(_mismatch_message(self.mode)) from e
         return self.encryption_service.decrypt_data(encrypted_data)
 
 
@@ -342,7 +486,7 @@ class FasterCodec(SecureCodec):
 
     def decode(self, data: bytes) -> bytes:
         if len(data) < IV_LENGTH:
-            raise ValueError(_mismatch_message(self.mode))
+            raise EncryptionMismatch(_mismatch_message(self.mode))
         encrypted_data = EncryptedData(data[IV_LENGTH:], data[:IV_LENGTH])
         return self.encryption_service.decrypt_data(encrypted_data)
 
@@ -384,8 +528,8 @@ class PlaintextCodec:
             try:
                 return base64.b64decode(payload, validate=True)
             except Exception as e:
-                raise ValueError(_mismatch_message(self.mode)) from e
-        raise ValueError(_mismatch_message(self.mode))
+                raise EncryptionMismatch(_mismatch_message(self.mode)) from e
+        raise EncryptionMismatch(_mismatch_message(self.mode))
 
 
 _CODECS = {
@@ -407,8 +551,12 @@ def _mismatch_message(mode: str) -> str:
 _insecure_warned = False
 
 
-def build_codec(encryption: 'str | bool | None' = None):
-    """Return the codec for `encryption`, warning once if it disables encryption."""
+def build_codec(encryption: 'str | bool | None' = None, require_key: 'bool | None' = None):
+    """Return the codec for `encryption`, warning once if it disables encryption.
+
+    `require_key` only bites when encryption is actually on; with ENCRYPTION_OFF
+    there is no key in play, so requiring one would be nonsense.
+    """
     global _insecure_warned
 
     mode = resolve_encryption(encryption)
@@ -423,8 +571,9 @@ def build_codec(encryption: 'str | bool | None' = None):
         return PlaintextCodec()
 
     # get_crypto_key() is only consulted when a key is actually needed, so the
-    # missing-CRYPTO_KEY warning stays quiet when encryption is off.
-    return _CODECS[mode](get_crypto_key())
+    # missing-CRYPTO_KEY warning (and require_key) stay out of the way when
+    # encryption is off.
+    return _CODECS[mode](get_crypto_key(resolve_require_key(require_key)))
 
 
 @dataclass
@@ -438,6 +587,38 @@ class Message:
     def get_obj(self) -> dict | list | int | float | bool | str | None:
         return json.loads(self.get_str())
 
+    @property
+    def is_error(self) -> bool:
+        """True if the server's handler raised while processing this request."""
+        return self.data.startswith(HANDLER_ERROR_TOKEN)
+
+    @property
+    def error(self) -> HandlerErrorInfo | None:
+        """The failure this reply reports, or None for an ordinary reply."""
+        if not self.is_error:
+            return None
+        try:
+            payload = json.loads(self.data[len(HANDLER_ERROR_TOKEN):].decode())
+        except Exception:
+            return HandlerErrorInfo('Error', 'unreadable error payload from server')
+        return HandlerErrorInfo(
+            type=str(payload.get('type') or 'Error'),
+            message=str(payload.get('message') or ''),
+            method=payload.get('method'),
+            traceback=payload.get('traceback'),
+        )
+
+    def raise_for_error(self) -> 'Message':
+        """Raise HandlerError if this reply reports a failure; else return self.
+
+        Lets a caller treat a remote handler failure the way it would treat a
+        local one, instead of the request simply never being answered.
+        """
+        info = self.error
+        if info is not None:
+            raise HandlerError(info)
+        return self
+
 
 class Client:
     def __init__(
@@ -446,12 +627,15 @@ class Client:
             port: int, 
             on_receive: Callable[[Message], Awaitable[None] | None],
             encryption: str | bool | None = None,
+            require_key: bool | None = None,
         ) -> None:
         # Initialize encryption service
         self.client_id = str(uuid.uuid4())
 
         # Must match the Server's mode; see build_codec/ENCRYPTION_MODES.
-        self.codec = build_codec(encryption)
+        # require_key=True turns a missing $CRYPTO_KEY into a MissingCryptoKey
+        # raised right here, rather than a warning nobody reads.
+        self.codec = build_codec(encryption, require_key)
         self.encryption = self.codec.mode
         self.encryption_service = self.codec.encryption_service
 
@@ -490,6 +674,18 @@ class Client:
 
     def decrypt(self, data: bytes) -> bytes:
         return self.codec.decode(data)
+
+    def _check_handshake_ack(self, frame: bytes) -> None:
+        """Validate the server's answer to a handshake frame.
+
+        The error check runs before decrypting, because the one failure it
+        reports -- the two ends disagreeing about encryption -- is precisely the
+        case where decrypting is what fails. An `assert` here would also vanish
+        under `python -O`, taking the check with it.
+        """
+        check_handshake_error(frame, self.encryption)
+        if self.decrypt(frame) != b'ok':
+            raise ConnectionError('unexpected handshake response from server')
 
     def send(self, method: str, data: bytes) -> str:
         # self.ping()
@@ -564,7 +760,7 @@ class Client:
         self.receive_conn.connect((self.host, self.port))
 
         send(self.receive_conn, self.encrypt(SPLIT_TOKEN.join([b'receive', self.client_id.encode()])))
-        assert b'ok' == self.decrypt(receive(self.receive_conn))
+        self._check_handshake_ack(receive(self.receive_conn))
 
         # Start the receive thread
         self.receiving = True
@@ -578,7 +774,7 @@ class Client:
         self.send_conn.connect((self.host, self.port))
 
         send(self.send_conn, self.encrypt(SPLIT_TOKEN.join([b'send', self.client_id.encode()])))
-        assert b'ok' == self.decrypt(receive(self.send_conn))
+        self._check_handshake_ack(receive(self.send_conn))
 
     def close(self) -> None:
         try:
@@ -623,6 +819,11 @@ class Client:
         if not self.codec.offload:
             return self.codec.decode(data)
         return await asyncio.to_thread(self.decrypt, data)
+
+    async def _acheck_handshake_ack(self, frame: bytes) -> None:
+        check_handshake_error(frame, self.encryption)
+        if (await self.adecrypt(frame)) != b'ok':
+            raise ConnectionError('unexpected handshake response from server')
 
     async def asend(self, method: str, data: bytes) -> str:
         # await self.aping()
@@ -709,7 +910,7 @@ class Client:
             # await async_send(self.receive_conn, await self.aencrypt(SPLIT_TOKEN.join([b'receive', self.client_id.encode()])))
             # assert b'ok' == await self.adecrypt(await async_receive(self.receive_conn))
             send(self.receive_conn, self.encrypt(SPLIT_TOKEN.join([b'receive', self.client_id.encode()])))
-            assert b'ok' == self.decrypt(receive(self.receive_conn))
+            self._check_handshake_ack(receive(self.receive_conn))
         
         await asyncio.to_thread(receive_socket_setup)
 
@@ -727,7 +928,7 @@ class Client:
         # self.send_conn.connect((self.host, self.port))
 
         await async_send(self.send_conn, await self.aencrypt(SPLIT_TOKEN.join([b'send', self.client_id.encode()])))
-        assert b'ok' == await self.adecrypt(await async_receive(self.send_conn))
+        await self._acheck_handshake_ack(await async_receive(self.send_conn))
 
     async def aclose(self) -> None:
         try:
@@ -797,20 +998,31 @@ class ServerRequest:
     def send(self, data: str) -> None:
         self.send_data(data.encode())
 
+    def send_error(self, exc: BaseException, include_traceback: bool = False) -> None:
+        """Reply to this request with a failure the client can recognise."""
+        self.send_data(encode_handler_error(exc, self.method, include_traceback))
 
+
+# `connection_type` is CONNECTION_SEND, CONNECTION_RECEIVE, or None when the
+# handshake failed before the socket said which one it was. It defaults to None
+# so callbacks written against the older single-field payloads still construct
+# and unpack unchanged.
 @dataclass
 class OnOpenInfo:
     client_id: str
+    connection_type: str | None = None
 
 
 @dataclass
 class OnCloseInfo:
     client_id: str
+    connection_type: str | None = None
 
 
 @dataclass
 class OnFinallyInfo:
     client_id: str | None
+    connection_type: str | None = None
 
 
 class Server:
@@ -828,6 +1040,8 @@ class Server:
             on_finally: Callable[[OnFinallyInfo], None | Awaitable[None]] = None,
 
             encryption: str | bool | None = None,
+            require_key: bool | None = None,
+            send_error_traceback: bool = False,
         ):
         self.host = host
         self.port = port
@@ -838,11 +1052,19 @@ class Server:
         self.on_open_receive: Callable[[OnOpenInfo], None | Awaitable[None]] = on_open_receive
         self.on_finally: Callable[[OnFinallyInfo], None | Awaitable[None]] = on_finally
 
+        # A handler failure is reported to the client by type and message. The
+        # traceback names server-side files and code, so it only goes over the
+        # wire when the embedder asks for it.
+        self.send_error_traceback = send_error_traceback
+
         self.client_queue: dict[str, queue.Queue | asyncio.Queue] = {}
         self.client_send_socket: dict[str, socket.socket] = {}
 
         # Must match every Client's mode; see build_codec/ENCRYPTION_MODES.
-        self.codec = build_codec(encryption)
+        # require_key=True turns a missing $CRYPTO_KEY into a MissingCryptoKey
+        # raised right here, so a production deployment fails at startup rather
+        # than coming up quietly on the built-in insecure key.
+        self.codec = build_codec(encryption, require_key)
         self.encryption = self.codec.mode
         self.encryption_service = self.codec.encryption_service
 
@@ -851,6 +1073,60 @@ class Server:
 
     def decrypt(self, data: bytes) -> bytes:
         return self.codec.decode(data)
+
+    def _parse_handshake(self, frame: bytes) -> tuple[bytes, str]:
+        """Read a client's opening frame, or say why it could not be read.
+
+        A frame written under a different encryption mode is unreadable rather
+        than invalid, so both the decode failure and the malformed-plaintext case
+        that a mode disagreement can also produce are reported the same way.
+        """
+        try:
+            client_type, client_id = self.decrypt(frame).split(SPLIT_TOKEN, 1)
+        except EncryptionMismatch:
+            raise
+        except ValueError as e:
+            # Decoded, but into something that is not a handshake -- e.g. a
+            # 'faster' nonce that happened to start with the plaintext tag byte.
+            raise EncryptionMismatch(_mismatch_message(self.encryption)) from e
+        return client_type, client_id.decode()
+
+    def _report_handshake_failure(self, s, exc: BaseException) -> None:
+        """Log one clean line and tell the client what the server could not read.
+
+        Routine disconnects are already a single line; an encryption
+        disagreement is just as routine from the server's point of view and does
+        not warrant an unhandled thread traceback. The reply is what turns the
+        client's "connection closed" into the same diagnosis.
+        """
+        print(f'Rejected connection: {exc}')
+        try:
+            send(s, _handshake_error_frame(self.encryption))
+        except OSError:
+            pass  # client already gone
+
+    def _run_handler(self, request: 'ServerRequest') -> None:
+        """Run the user handler for one request, surviving whatever it raises.
+
+        A handler that raises must not take down the connection: the other
+        requests on it are unrelated, and the client is waiting on this one.
+        """
+        try:
+            run_maybe_async(self.handler, request)
+        except Exception as e:
+            print(f'Error in handler for request {request.request_id} '
+                  f'(method {request.method!r}) from {request.client_id}: {e}')
+            traceback.print_exc()
+            self._reply_handler_error(request, e)
+
+    def _reply_handler_error(self, request: 'ServerRequest', exc: BaseException) -> None:
+        try:
+            request.send_error(exc, self.send_error_traceback)
+        except Exception:
+            # Nothing left to do but say so; the client will see the connection
+            # end rather than a reply, which is the old behaviour.
+            print(f'Could not report handler error for request {request.request_id}')
+            traceback.print_exc()
 
     def start(self):
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -919,6 +1195,8 @@ class Server:
                 send(s, b'ok')
         except (ConnectionClosed, OSError):
             pass  # client went away; fall through and stop the handler loop
+        except EncryptionMismatch as e:
+            print(f'Dropping client {client_id}: {e}')
         except Exception as e:
             print(f'Error handling requests from {client_id}: {e}')
             traceback.print_exc()
@@ -928,10 +1206,20 @@ class Server:
         
     def handle_client(self, s):
         client_id = None
+        connection_type = None
         try:
             with s:
-                client_type, client_id = self.decrypt(receive(s)).split(SPLIT_TOKEN, 1)
-                client_id = client_id.decode()
+                try:
+                    client_type, client_id = self._parse_handshake(receive(s))
+                except EncryptionMismatch as e:
+                    self._report_handshake_failure(s, e)
+                    return
+
+                connection_type = (
+                    CONNECTION_SEND if client_type == b'send'
+                    else CONNECTION_RECEIVE if client_type == b'receive'
+                    else None
+                )
 
                 if client_type == b'send':
                     try:
@@ -942,7 +1230,7 @@ class Server:
                         self.client_send_socket[client_id] = s
 
                         if callable(self.on_open):
-                            run_maybe_async(self.on_open, OnOpenInfo(client_id))
+                            run_maybe_async(self.on_open, OnOpenInfo(client_id, CONNECTION_SEND))
 
                         send(s, self.encrypt(b'ok'))
 
@@ -959,7 +1247,7 @@ class Server:
                         while (request := request_q.get()) is not None:
                             request: ServerRequest
                             # print('handling', request)
-                            run_maybe_async(self.handler, request)
+                            self._run_handler(request)
 
                         q.put(b'close')
                         # Wait for the receive side to drain, but do not park
@@ -972,14 +1260,14 @@ class Server:
                         self.client_send_socket.pop(client_id, None)
                         if callable(self.on_close):
                             try:
-                                run_maybe_async(self.on_close, OnCloseInfo(client_id))
+                                run_maybe_async(self.on_close, OnCloseInfo(client_id, CONNECTION_SEND))
                             except Exception as e:
                                 print(f'Error in on_close: {e}')
                                 traceback.print_exc()
                 elif client_type == b'receive':
                     try:
                         if callable(self.on_open_receive):
-                            run_maybe_async(self.on_open_receive, OnOpenInfo(client_id))
+                            run_maybe_async(self.on_open_receive, OnOpenInfo(client_id, CONNECTION_RECEIVE))
                         send(s, self.encrypt(b'ok'))
 
                         t = time.time()
@@ -1010,7 +1298,7 @@ class Server:
 
                         if callable(self.on_close_receive):
                             try:
-                                run_maybe_async(self.on_close_receive, OnCloseInfo(client_id))
+                                run_maybe_async(self.on_close_receive, OnCloseInfo(client_id, CONNECTION_RECEIVE))
                             except Exception as e:
                                 print(f'Error in on_close_receive: {e}')
                                 traceback.print_exc()
@@ -1018,13 +1306,31 @@ class Server:
         except (ConnectionClosed, OSError) as e:
             # A client dropping its connection is routine, not a crash.
             print(f'Client {client_id} disconnected: {e}')
+        except EncryptionMismatch as e:
+            # Mid-stream rather than at the handshake; still not a crash.
+            print(f'Client {client_id} disconnected: {e}')
+        except Exception as e:
+            # This runs in a bare thread, so anything reaching here would
+            # otherwise print an unhandled traceback and nothing else.
+            print(f'Error handling client {client_id}: {e}')
+            traceback.print_exc()
         finally:
             if callable(self.on_finally):
                 try:
-                    run_maybe_async(self.on_finally, OnFinallyInfo(client_id))
+                    run_maybe_async(self.on_finally, OnFinallyInfo(client_id, connection_type))
                 except Exception as e:
                     print(f'Error in on_finally: {e}')
                     traceback.print_exc()
+
+    async def _arun_handler(self, request: 'ServerRequest') -> None:
+        """Async twin of _run_handler; see there for why this guard exists."""
+        try:
+            await run_as_async(self.handler, request)
+        except Exception as e:
+            print(f'Error in handler for request {request.request_id} '
+                  f'(method {request.method!r}) from {request.client_id}: {e}')
+            traceback.print_exc()
+            self._reply_handler_error(request, e)
 
     async def aencrypt(self, data: bytes) -> bytes:
         # See Client.aencrypt: the thread hop only pays for itself under 'secure'.
@@ -1096,10 +1402,28 @@ class Server:
         
     async def ahandle_client(self, s: socket.socket):
         client_id = None
+        connection_type = None
         try:
             with s:
-                client_type, client_id = (await self.adecrypt(await async_receive(s))).split(SPLIT_TOKEN, 1)
-                client_id = client_id.decode()
+                try:
+                    frame = await async_receive(s)
+                    if self.codec.offload:
+                        client_type, client_id = await asyncio.to_thread(self._parse_handshake, frame)
+                    else:
+                        client_type, client_id = self._parse_handshake(frame)
+                except EncryptionMismatch as e:
+                    print(f'Rejected connection: {e}')
+                    try:
+                        await async_send(s, _handshake_error_frame(self.encryption))
+                    except OSError:
+                        pass  # client already gone
+                    return
+
+                connection_type = (
+                    CONNECTION_SEND if client_type == b'send'
+                    else CONNECTION_RECEIVE if client_type == b'receive'
+                    else None
+                )
 
                 if client_type == b'send':
                     try:
@@ -1110,7 +1434,7 @@ class Server:
                         self.client_send_socket[client_id] = s
 
                         if callable(self.on_open):
-                            await run_as_async(self.on_open, OnOpenInfo(client_id))
+                            await run_as_async(self.on_open, OnOpenInfo(client_id, CONNECTION_SEND))
 
                         await async_send(s, self.encrypt(b'ok'))
 
@@ -1121,7 +1445,7 @@ class Server:
 
                         while (request := await request_q.get()) is not None:
                             request: ServerRequest
-                            await run_as_async(self.handler, request)
+                            await self._arun_handler(request)
                     
                         await q.put(b'close')
                         deadline = time.time() + CLIENT_TEARDOWN_TIMEOUT
@@ -1132,14 +1456,14 @@ class Server:
                         self.client_send_socket.pop(client_id, None)
                         if callable(self.on_close):
                             try:
-                                await run_as_async(self.on_close, OnCloseInfo(client_id))
+                                await run_as_async(self.on_close, OnCloseInfo(client_id, CONNECTION_SEND))
                             except Exception as e:
                                 print(f'Error in on_close: {e}')
                                 traceback.print_exc()
                 elif client_type == b'receive':
                     try:
                         if callable(self.on_open_receive):
-                            await run_as_async(self.on_open_receive, OnOpenInfo(client_id))
+                            await run_as_async(self.on_open_receive, OnOpenInfo(client_id, CONNECTION_RECEIVE))
 
                         await async_send(s, await self.aencrypt(b'ok'))
 
@@ -1170,17 +1494,27 @@ class Server:
 
                         if callable(self.on_close_receive):
                             try:
-                                await run_as_async(self.on_close_receive, OnCloseInfo(client_id))
+                                await run_as_async(self.on_close_receive, OnCloseInfo(client_id, CONNECTION_RECEIVE))
                             except Exception as e:
                                 print(f'Error in on_close_receive: {e}')
                                 traceback.print_exc()
                 # method, data = receive(s).split(SPLIT_TOKEN)
         except (ConnectionClosed, OSError) as e:
             print(f'Client {client_id} disconnected: {e}')
+        except asyncio.CancelledError:
+            raise
+        except EncryptionMismatch as e:
+            print(f'Client {client_id} disconnected: {e}')
+        except Exception as e:
+            # ahandle_client runs as a bare task, whose exception would surface
+            # only as an unretrieved-exception warning when it is garbage
+            # collected -- if at all.
+            print(f'Error handling client {client_id}: {e}')
+            traceback.print_exc()
         finally:
             if callable(self.on_finally):
                 try:
-                    await run_as_async(self.on_finally, OnFinallyInfo(client_id))
+                    await run_as_async(self.on_finally, OnFinallyInfo(client_id, connection_type))
                 except Exception as e:
                     print(f'Error in on_finally: {e}')
                     traceback.print_exc()

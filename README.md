@@ -17,7 +17,8 @@ It comes with built-in **AES-GCM end-to-end encryption** and **bz2 compression**
   - **Sync & Async Support**: Provides both a standard threading API and a modern `asyncio` API.
   - **Simple Handler-Based API**: Use a clean handler function on the server and an `on_receive` callback on the client to process messages.
   - **Unique Client Identification**: Manages clients using unique UUIDs, making it easy to track connections.
-  - **Connection Lifecycle Hooks**: Optional `on_open`, `on_close` and `on_finally` callbacks on the server.
+  - **Connection Lifecycle Hooks**: Optional `on_open`, `on_close` and `on_finally` callbacks on the server, each told which of the client's two sockets it is for.
+  - **Handler Failures Stay Local**: An exception in one request's handler is reported to that client and does not disturb the connection or any other request.
 
 -----
 
@@ -176,12 +177,13 @@ if __name__ == "__main__":
 
 ## 📚 API Reference
 
-### `Client(host, port, on_receive, encryption=None)`
+### `Client(host, port, on_receive, encryption=None, require_key=None)`
 
 `on_receive` is called with a `Message` for every message pushed by the server. It
 may be a normal function or an `async def` coroutine function.
 
 `encryption` selects the wire format -- see [Encryption Modes](#-encryption-modes).
+`require_key` is described under [Requiring a key](#requiring-a-key).
 
 | Method | Description |
 | --- | --- |
@@ -203,6 +205,11 @@ each call holds the send socket until its acknowledgement returns.
 | `data: bytes` | Raw payload. |
 | `get_str() -> str` | Payload decoded as UTF-8. |
 | `get_obj()` | Payload parsed as JSON. |
+| `is_error: bool` | True if the server's handler raised on this request. |
+| `error` | `HandlerErrorInfo` for a failure, else `None`. |
+| `raise_for_error()` | Raise `HandlerError` if this is a failure; else return `self`. |
+
+See [When a handler raises](#when-a-handler-raises).
 
 ### `Server(host, port, handler, ...)`
 
@@ -215,20 +222,74 @@ each call holds the send socket until its acknowledgement returns.
 | `on_close_receive` | A client's receive socket closes. Receives `OnCloseInfo`. |
 | `on_finally` | Any client connection ends, for any reason. Receives `OnFinallyInfo`. |
 
-`Server` also takes `encryption` -- see [Encryption Modes](#-encryption-modes).
+`Server` also takes:
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `encryption` | `None` | Wire format -- see [Encryption Modes](#-encryption-modes). |
+| `require_key` | `None` | Fail at construction if `CRYPTO_KEY` is unset -- see [Requiring a key](#requiring-a-key). |
+| `send_error_traceback` | `False` | Include the server-side traceback in error replies -- see [When a handler raises](#when-a-handler-raises). |
 
 Every callback, and `handler` itself, may be a normal function or an `async def`
-coroutine function. `OnOpenInfo` and `OnCloseInfo` carry a `client_id`;
-`OnFinallyInfo` carries `client_id: str | None`, which is `None` if the connection
-failed before the client identified itself.
-
-Because each client opens two sockets, `on_finally` fires twice per client — once
-per connection.
+coroutine function.
 
 | Method | Description |
 | --- | --- |
 | `start()` | Run the threaded server. Blocks forever. |
 | `astart()` | Run the asyncio server. Blocks forever. |
+
+-----
+
+### Which callback fires for which socket
+
+This is the least obvious part of the API, so it is worth stating exactly.
+
+Each client holds **two** connections under one `client_id` (see
+[How It Works](#-how-it-works)). `on_open`/`on_close` are send-socket events and
+`on_open_receive`/`on_close_receive` are receive-socket events, but **`on_finally`
+is per connection**, so it fires **twice** per client.
+
+Every payload carries a `connection_type` saying which socket it is about:
+
+| Payload | Fields |
+| --- | --- |
+| `OnOpenInfo` | `client_id: str`, `connection_type: str \| None` |
+| `OnCloseInfo` | `client_id: str`, `connection_type: str \| None` |
+| `OnFinallyInfo` | `client_id: str \| None`, `connection_type: str \| None` |
+
+`connection_type` is `'send'`, `'receive'`, or `None` when the handshake failed
+before the socket said which it was — in which case `client_id` is `None` too.
+The constants `bisocket.CONNECTION_SEND` and `bisocket.CONNECTION_RECEIVE` hold
+those two strings.
+
+For one client that connects, sends a request and disconnects, the order is:
+
+| # | Callback | `connection_type` |
+| --- | --- | --- |
+| 1 | `on_open_receive` | `'receive'` |
+| 2 | `on_open` | `'send'` |
+| 3 | `on_close_receive` | `'receive'` |
+| 4 | **`on_finally`** | **`'receive'`** |
+| 5 | `on_close` | `'send'` |
+| 6 | **`on_finally`** | **`'send'`** |
+
+Note steps 4 and 5: the **receive socket's `on_finally` arrives before
+`on_close`**. This matters if you allocate per-client resources in `on_open` and
+free them in `on_finally` — the first `on_finally` fires while the client is still
+live, so freeing there gives away a still-running client's state. Filter on
+`connection_type` instead:
+
+```python
+from bisocket import Server, CONNECTION_SEND
+
+def on_finally(info):
+    # Fires exactly once per client, after on_close, when the client is really gone.
+    if info.connection_type == CONNECTION_SEND:
+        release_resources_for(info.client_id)
+```
+
+`connection_type` is a field with a default of `None`, so existing callbacks — and
+any code constructing these payloads positionally — keep working unchanged.
 
 ### `ServerRequest`
 
@@ -240,15 +301,60 @@ per connection.
 | `data: bytes` | Raw payload. |
 | `send_data(data: bytes)` | Queue a `bytes` response back to that client. |
 | `send(data: str)` | Same, for a `str`. |
+| `send_error(exc)` | Queue a response the client will see as a failure. |
 
 A handler may call `send_data()` any number of times, including zero. Responses are
 pushed over the client's receive socket, so they are not tied to a request/response
 turn.
 
+### When a handler raises
+
+A `handler` that raises does not disturb the connection. The failure is logged
+server-side with its traceback, the loop moves on to the next request, and the
+client gets a reply on that `request_id` marked as an error — so a caller awaiting
+that request is never left waiting forever:
+
+```python
+from bisocket import Client, HandlerError
+
+def on_receive(message):
+    if message.is_error:
+        print(f'request {message.request_id} failed: {message.error}')
+        # -> request 8f3c... failed: ValueError handling 'resize': bad dimensions
+        return
+    handle(message.get_obj())
+```
+
+`message.error` is a `HandlerErrorInfo` with `type`, `message`, `method` and
+`traceback`. `message.raise_for_error()` re-raises it locally as a `HandlerError`
+if you would rather handle it as an exception.
+
+The traceback is **not** sent by default, since it names server-side files and
+code. Pass `Server(..., send_error_traceback=True)` on a server whose clients are
+trusted to see it.
+
+Error replies ride inside the existing payload field, behind a marker byte string,
+so a client that never checks `is_error` still receives an ordinary, well-formed
+`Message` on the right `request_id` rather than failing to parse anything.
+
+A handler may still return without sending anything; only a handler that *raises*
+produces an error reply.
+
+-----
+
 ### Aliases
 
 `BiClient`, `BiServer`, `BiMessage` and `BiServerRequest` are aliases for `Client`,
 `Server`, `Message` and `ServerRequest`.
+
+### Exceptions
+
+| Exception | Raised when |
+| --- | --- |
+| `ConnectionClosed` | The peer went away mid-frame. Subclasses `ConnectionError`. |
+| `EncryptionMismatch` | A frame could not be read under this peer's mode. Subclasses `ValueError`. |
+| `MissingCryptoKey` | `require_key` is on and `CRYPTO_KEY` is unset. Subclasses `RuntimeError`. |
+| `HandlerError` | Raised by `Message.raise_for_error()`. Carries `.info`. |
 
 -----
 
@@ -321,10 +427,34 @@ where avoiding nonce generation is measurable.
 ### ⚠️ Both ends must agree
 
 The three formats are not interchangeable. A `Client` and `Server` in different
-modes cannot talk, and the mismatch raises a `ValueError` naming the problem rather
-than failing obscurely. When changing the mode of a running system, either take a
-brief outage or move through `'secure'` (which is wire-compatible with 0.0.8) while
+modes cannot talk. When changing the mode of a running system, either take a brief
+outage or move through `'secure'` (which is wire-compatible with 0.0.8) while
 rolling.
+
+A mismatch is reported at both ends. The server logs one line and drops the
+connection, the same way it already treats a routine disconnect:
+
+```
+Rejected connection: could not read frame as 'secure'. A Client and a Server must
+use the same encryption mode -- check that both set the same value ...
+```
+
+and it answers the unreadable handshake with a plaintext note saying which mode it
+is using, so the client raises `EncryptionMismatch` naming *both* sides rather than
+a bare "connection closed":
+
+```
+bisocket.EncryptionMismatch: the server could not read this connection: the server
+is using encryption 'secure' and this client is using 'faster'. Both ends must use
+the same mode ...
+```
+
+`EncryptionMismatch` subclasses `ValueError`, which is what the codecs raised
+before, so `except ValueError` keeps working.
+
+Nothing was added to the bytes a client *sends*, so a client built from this
+revision still handshakes with an older server exactly as before; against such a
+server a mismatch simply reports itself the old way.
 
 ### What `'off'` gives up
 
@@ -356,6 +486,32 @@ export CRYPTO_KEY=$(openssl rand -hex 32)
 
 If `CRYPTO_KEY` is not set, a default, insecure key (`'secret-lol'`) is used and a warning is printed to stderr. This is intended **only for local testing and development**.
 
+### Requiring a key
+
+A warning in a long-running server's log is easy to miss, and the failure mode is
+silent: the service comes up and runs happily on a publicly known key. Pass
+`require_key=True` to make a missing `CRYPTO_KEY` a startup failure instead:
+
+```python
+from bisocket import Server, MissingCryptoKey
+
+# Raises MissingCryptoKey right here if CRYPTO_KEY is unset.
+server = Server('0.0.0.0', 65432, handler, require_key=True)
+```
+
+`Client` takes the same argument. Setting `BISOCKET_REQUIRE_KEY=1` in the
+environment turns it on for both without a code change, which is the easy way to
+harden a production image while leaving development alone:
+
+```bash
+export BISOCKET_REQUIRE_KEY=1
+```
+
+An explicit `require_key=` argument wins over the environment variable, so a test
+harness inside a hardened image can still opt out. The requirement applies only
+when encryption is actually on: with `encryption='off'` there is no key in play, so
+`require_key=True` is accepted and ignored.
+
 This section describes the `'secure'` and `'faster'` modes. With
 `encryption='off'` there is no encryption at all and none of it applies.
 
@@ -366,6 +522,17 @@ Note the current limits of this model, which matter if you expose a server publi
   - `client_id` is chosen by the client and is not verified.
   - The key is derived by a single SHA-256 pass, not a slow KDF, so a weak
     `CRYPTO_KEY` is cheap to brute force. Use a long random value.
+
+-----
+
+## 🧪 Running the tests
+
+The suite drives real servers over loopback sockets, since that is the only place
+the behaviour it covers actually exists.
+
+```bash
+pip install pytest && python -m pytest
+```
 
 -----
 

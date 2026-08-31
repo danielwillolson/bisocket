@@ -19,13 +19,23 @@ server_handler_example = main.server_handler_example
 OnOpenInfo = main.OnOpenInfo
 OnCloseInfo = main.OnCloseInfo
 OnFinallyInfo = main.OnFinallyInfo
+
 ConnectionClosed = main.ConnectionClosed
+EncryptionMismatch = main.EncryptionMismatch
+MissingCryptoKey = main.MissingCryptoKey
+HandlerError = main.HandlerError
+HandlerErrorInfo = main.HandlerErrorInfo
+
+CONNECTION_SEND = main.CONNECTION_SEND
+CONNECTION_RECEIVE = main.CONNECTION_RECEIVE
+CONNECTION_TYPES = main.CONNECTION_TYPES
 
 ENCRYPTION_SECURE = main.ENCRYPTION_SECURE
 ENCRYPTION_FASTER = main.ENCRYPTION_FASTER
 ENCRYPTION_OFF = main.ENCRYPTION_OFF
 ENCRYPTION_MODES = main.ENCRYPTION_MODES
 resolve_encryption = main.resolve_encryption
+resolve_require_key = main.resolve_require_key
 
 BiClient = main.BiClient
 BiServer = main.BiServer
@@ -40,8 +50,11 @@ __all__ = [
     'main',
     'Client', 'Server', 'Message', 'ServerRequest', 'server_handler_example',
     'BiClient', 'BiServer', 'BiMessage', 'BiServerRequest',
-    'OnOpenInfo', 'OnCloseInfo', 'OnFinallyInfo', 'ConnectionClosed',
+    'OnOpenInfo', 'OnCloseInfo', 'OnFinallyInfo',
+    'ConnectionClosed', 'EncryptionMismatch', 'MissingCryptoKey',
+    'HandlerError', 'HandlerErrorInfo',
+    'CONNECTION_SEND', 'CONNECTION_RECEIVE', 'CONNECTION_TYPES',
     'ENCRYPTION_SECURE', 'ENCRYPTION_FASTER', 'ENCRYPTION_OFF', 'ENCRYPTION_MODES',
-    'resolve_encryption',
+    'resolve_encryption', 'resolve_require_key',
     'VERSION', '__version__',
 ]
