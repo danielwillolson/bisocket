@@ -26,7 +26,7 @@ setup(
     description="bisocket is a high-level Python library for simple, secure, and truly bidirectional socket communication, using a dual-socket architecture to enable non-blocking, full-duplex I/O. It provides automatic AES-GCM encryption and supports both synchronous (threading) and asynchronous (asyncio) client-server applications",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="",
+    url="https://github.com/danielwillolson/bisocket",
     packages=find_packages(),
     # package_name="terminal_query_search",
     metadata_version="2.3",  # Enforce an older version

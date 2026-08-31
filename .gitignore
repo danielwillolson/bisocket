@@ -1,5 +1,6 @@
 venv
 dist
+__pycache__
 cronevents.egg-info
 bisocket.egg-info
 
