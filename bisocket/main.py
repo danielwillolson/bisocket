@@ -1,6 +1,7 @@
 import os
 import sys
 import bz2
+import base64
 import uuid
 import time
 import json
@@ -28,6 +29,31 @@ RECV_SIZE = 65536
 CLIENT_TEARDOWN_TIMEOUT = 30.0
 DEFAULT_CRYPTO_KEY = 'secret-lol'
 SHUTDOWN_TIMEOUT = 5.0
+
+# AES-GCM nonce length. Fixed, so the 'faster' wire format can put the nonce at a
+# known offset instead of paying for a delimiter that random bytes might contain.
+IV_LENGTH = 12
+
+# How much work every frame goes through on its way to the socket. A Client and a
+# Server have to agree: the three formats are not interchangeable.
+ENCRYPTION_SECURE = 'secure'   # AES-GCM, then bz2 -- the original 0.0.8 format
+ENCRYPTION_FASTER = 'faster'   # AES-GCM only
+ENCRYPTION_OFF = 'off'         # no encryption at all
+
+ENCRYPTION_MODES = (ENCRYPTION_SECURE, ENCRYPTION_FASTER, ENCRYPTION_OFF)
+
+_ENCRYPTION_ALIASES = {
+    ENCRYPTION_SECURE: ENCRYPTION_SECURE,
+    'on': ENCRYPTION_SECURE, 'true': ENCRYPTION_SECURE, '1': ENCRYPTION_SECURE,
+    'yes': ENCRYPTION_SECURE, 'default': ENCRYPTION_SECURE, 'bz2': ENCRYPTION_SECURE,
+    ENCRYPTION_FASTER: ENCRYPTION_FASTER,
+    'fast': ENCRYPTION_FASTER, 'fastest': ENCRYPTION_FASTER,
+    'nocompress': ENCRYPTION_FASTER, 'no-compress': ENCRYPTION_FASTER,
+    ENCRYPTION_OFF: ENCRYPTION_OFF,
+    'none': ENCRYPTION_OFF, 'false': ENCRYPTION_OFF, '0': ENCRYPTION_OFF,
+    'no': ENCRYPTION_OFF, 'plaintext': ENCRYPTION_OFF, 'plain': ENCRYPTION_OFF,
+    'insecure': ENCRYPTION_OFF, 'disabled': ENCRYPTION_OFF,
+}
 
 
 class ConnectionClosed(ConnectionError):
@@ -83,6 +109,28 @@ def get_crypto_key() -> str:
             file=sys.stderr,
         )
     return DEFAULT_CRYPTO_KEY
+
+
+def resolve_encryption(mode: 'str | bool | None' = None) -> str:
+    """Normalise an encryption mode, falling back to $BISOCKET_ENCRYPTION.
+
+    Accepts a canonical name ('secure', 'faster', 'off'), a bool, or one of the
+    aliases in _ENCRYPTION_ALIASES. None means 'not specified here', so the
+    environment decides; unset environment means the secure default.
+    """
+    if mode is None:
+        mode = os.environ.get('BISOCKET_ENCRYPTION')
+    if mode is None or mode == '':
+        return ENCRYPTION_SECURE
+    if isinstance(mode, bool):
+        return ENCRYPTION_SECURE if mode else ENCRYPTION_OFF
+
+    try:
+        return _ENCRYPTION_ALIASES[str(mode).strip().lower()]
+    except KeyError:
+        raise ValueError(
+            f'unknown encryption mode {mode!r}; expected one of {", ".join(ENCRYPTION_MODES)}'
+        ) from None
 
 
 def send(conn: socket.socket, data: bytes) -> None:
@@ -229,7 +277,7 @@ class EncryptionService:
     def encrypt_data(self, data: bytes) -> EncryptedData:
         """Encrypt data using AES-GCM"""
         # Generate 12-byte IV
-        iv = os.urandom(12)
+        iv = os.urandom(IV_LENGTH)
 
         # Encrypt data (includes auth tag automatically)
         encrypted = self.aesgcm.encrypt(iv, data, None)
@@ -247,6 +295,136 @@ class EncryptionService:
         except Exception as e:
             print(f"Decryption error: {str(e)}")
             raise ValueError("Failed to decrypt data")
+
+
+class SecureCodec:
+    """AES-GCM, then bz2. The original format, kept as the default so a 0.0.9
+    peer still talks to a 0.0.8 one.
+
+    The bz2 pass runs *after* encryption, so it is compressing ciphertext -- which
+    is incompressible. It costs a lot of CPU per frame and saves almost nothing.
+    'faster' exists to skip it.
+    """
+
+    mode = ENCRYPTION_SECURE
+    encrypts = True
+    offload = True  # bz2 at level 9 is slow enough to be worth a thread hop
+
+    def __init__(self, key_string: str):
+        self.encryption_service = EncryptionService(key_string)
+
+    def encode(self, data: bytes) -> bytes:
+        return self.encryption_service.encrypt_data(data).to_bytes()
+
+    def decode(self, data: bytes) -> bytes:
+        try:
+            encrypted_data = EncryptedData.from_bytes(data)
+        except Exception as e:
+            raise ValueError(_mismatch_message(self.mode)) from e
+        return self.encryption_service.decrypt_data(encrypted_data)
+
+
+class FasterCodec(SecureCodec):
+    """AES-GCM with no compression: same confidentiality, much less CPU.
+
+    The nonce goes in front of the ciphertext at a fixed offset rather than behind
+    a delimiter, because both halves are random bytes and could contain any
+    delimiter we picked.
+    """
+
+    mode = ENCRYPTION_FASTER
+    encrypts = True
+    offload = False  # AES-GCM is hardware-accelerated; a thread hop costs more
+
+    def encode(self, data: bytes) -> bytes:
+        encrypted = self.encryption_service.encrypt_data(data)
+        return encrypted.iv + encrypted.data
+
+    def decode(self, data: bytes) -> bytes:
+        if len(data) < IV_LENGTH:
+            raise ValueError(_mismatch_message(self.mode))
+        encrypted_data = EncryptedData(data[IV_LENGTH:], data[:IV_LENGTH])
+        return self.encryption_service.decrypt_data(encrypted_data)
+
+
+class PlaintextCodec:
+    """No encryption. For trusted networks only -- anything on the path can read
+    and modify every frame.
+
+    Payloads are arbitrary caller bytes, so one containing END_TOKEN would be cut
+    into two bogus frames by the reader. The other modes get away with ignoring
+    that because their output is ciphertext, but plaintext really can contain it.
+
+    Rather than encode every frame, each one is tagged with a single byte saying
+    how it was written: almost always _RAW, which passes the payload through
+    untouched, and _B64 for the rare frame that does contain END_TOKEN (base64 has
+    no '|', so the token cannot survive). The check is one substring scan at
+    memory speed, so the common path stays free of both the 33% base64 growth and
+    the extra pass over the buffer.
+    """
+
+    mode = ENCRYPTION_OFF
+    encrypts = False
+    offload = False
+    encryption_service = None
+
+    _RAW = b'r'
+    _B64 = b'b'
+
+    def encode(self, data: bytes) -> bytes:
+        if END_TOKEN in data:
+            return self._B64 + base64.b64encode(data)
+        return self._RAW + data
+
+    def decode(self, data: bytes) -> bytes:
+        tag, payload = data[:1], data[1:]
+        if tag == self._RAW:
+            return payload
+        if tag == self._B64:
+            try:
+                return base64.b64decode(payload, validate=True)
+            except Exception as e:
+                raise ValueError(_mismatch_message(self.mode)) from e
+        raise ValueError(_mismatch_message(self.mode))
+
+
+_CODECS = {
+    ENCRYPTION_SECURE: SecureCodec,
+    ENCRYPTION_FASTER: FasterCodec,
+    ENCRYPTION_OFF: PlaintextCodec,
+}
+
+
+def _mismatch_message(mode: str) -> str:
+    return (
+        f'could not read frame as {mode!r}. A Client and a Server must use the '
+        f'same encryption mode -- check that both set the same value (one of '
+        f'{", ".join(ENCRYPTION_MODES)}) via the encryption= argument or '
+        f'$BISOCKET_ENCRYPTION.'
+    )
+
+
+_insecure_warned = False
+
+
+def build_codec(encryption: 'str | bool | None' = None):
+    """Return the codec for `encryption`, warning once if it disables encryption."""
+    global _insecure_warned
+
+    mode = resolve_encryption(encryption)
+    if mode == ENCRYPTION_OFF:
+        if not _insecure_warned:
+            _insecure_warned = True
+            print(
+                'WARNING: bisocket encryption is off; frames are sent in plaintext. '
+                'Only do this on a trusted private network.',
+                file=sys.stderr,
+            )
+        return PlaintextCodec()
+
+    # get_crypto_key() is only consulted when a key is actually needed, so the
+    # missing-CRYPTO_KEY warning stays quiet when encryption is off.
+    return _CODECS[mode](get_crypto_key())
 
 
 @dataclass
@@ -267,11 +445,15 @@ class Client:
             host: str, 
             port: int, 
             on_receive: Callable[[Message], Awaitable[None] | None],
+            encryption: str | bool | None = None,
         ) -> None:
         # Initialize encryption service
         self.client_id = str(uuid.uuid4())
 
-        self.encryption_service = EncryptionService(get_crypto_key())
+        # Must match the Server's mode; see build_codec/ENCRYPTION_MODES.
+        self.codec = build_codec(encryption)
+        self.encryption = self.codec.mode
+        self.encryption_service = self.codec.encryption_service
 
         self.host = host
         self.port = port
@@ -304,11 +486,10 @@ class Client:
         self.close()
 
     def encrypt(self, data: bytes) -> bytes:
-        return self.encryption_service.encrypt_data(data).to_bytes()
-    
+        return self.codec.encode(data)
+
     def decrypt(self, data: bytes) -> bytes:
-        encrypted_data: EncryptedData = EncryptedData.from_bytes(data)
-        return self.encryption_service.decrypt_data(encrypted_data)
+        return self.codec.decode(data)
 
     def send(self, method: str, data: bytes) -> str:
         # self.ping()
@@ -432,12 +613,15 @@ class Client:
         await self.aclose()
 
     async def aencrypt(self, data: bytes) -> bytes:
-        # return self.encryption_service.encrypt_data(data).to_bytes()
+        # Only the bz2 in 'secure' is slow enough that handing it to a thread beats
+        # running it inline; for the other modes the hop is pure overhead.
+        if not self.codec.offload:
+            return self.codec.encode(data)
         return await asyncio.to_thread(self.encrypt, data)
-    
+
     async def adecrypt(self, data: bytes) -> bytes:
-        # data = EncryptedData.from_bytes(data)
-        # return self.encryption_service.decrypt_data(data)
+        if not self.codec.offload:
+            return self.codec.decode(data)
         return await asyncio.to_thread(self.decrypt, data)
 
     async def asend(self, method: str, data: bytes) -> str:
@@ -642,6 +826,8 @@ class Server:
             on_open_receive: Callable[[OnOpenInfo], None | Awaitable[None]] = None,
 
             on_finally: Callable[[OnFinallyInfo], None | Awaitable[None]] = None,
+
+            encryption: str | bool | None = None,
         ):
         self.host = host
         self.port = port
@@ -655,14 +841,16 @@ class Server:
         self.client_queue: dict[str, queue.Queue | asyncio.Queue] = {}
         self.client_send_socket: dict[str, socket.socket] = {}
 
-        self.encryption_service = EncryptionService(get_crypto_key())
+        # Must match every Client's mode; see build_codec/ENCRYPTION_MODES.
+        self.codec = build_codec(encryption)
+        self.encryption = self.codec.mode
+        self.encryption_service = self.codec.encryption_service
 
     def encrypt(self, data: bytes) -> bytes:
-        return self.encryption_service.encrypt_data(data).to_bytes()
-    
+        return self.codec.encode(data)
+
     def decrypt(self, data: bytes) -> bytes:
-        encrypted_data: EncryptedData = EncryptedData.from_bytes(data)
-        return self.encryption_service.decrypt_data(encrypted_data)
+        return self.codec.decode(data)
 
     def start(self):
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -839,9 +1027,14 @@ class Server:
                     traceback.print_exc()
 
     async def aencrypt(self, data: bytes) -> bytes:
+        # See Client.aencrypt: the thread hop only pays for itself under 'secure'.
+        if not self.codec.offload:
+            return self.codec.encode(data)
         return await asyncio.to_thread(self.encrypt, data)
-    
+
     async def adecrypt(self, data: bytes) -> bytes:
+        if not self.codec.offload:
+            return self.codec.decode(data)
         return await asyncio.to_thread(self.decrypt, data)
 
     async def astart(self):

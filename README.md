@@ -13,7 +13,7 @@ It comes with built-in **AES-GCM end-to-end encryption** and **bz2 compression**
 
   - **True Bidirectional Communication**: Uses separate sockets for sending and receiving, enabling non-blocking, full-duplex communication.
   - **End-to-End Encryption**: Automatic AES-GCM encryption for all messages ensures data privacy and integrity.
-  - **Data Compression**: Automatic `bz2` compression reduces bandwidth usage for large payloads.
+  - **Selectable Encryption Modes**: `secure`, `faster` or `off` per `Client`/`Server`, so a service on a trusted private network can trade protection for throughput.
   - **Sync & Async Support**: Provides both a standard threading API and a modern `asyncio` API.
   - **Simple Handler-Based API**: Use a clean handler function on the server and an `on_receive` callback on the client to process messages.
   - **Unique Client Identification**: Manages clients using unique UUIDs, making it easy to track connections.
@@ -176,10 +176,12 @@ if __name__ == "__main__":
 
 ## 📚 API Reference
 
-### `Client(host, port, on_receive)`
+### `Client(host, port, on_receive, encryption=None)`
 
 `on_receive` is called with a `Message` for every message pushed by the server. It
 may be a normal function or an `async def` coroutine function.
+
+`encryption` selects the wire format -- see [Encryption Modes](#-encryption-modes).
 
 | Method | Description |
 | --- | --- |
@@ -212,6 +214,8 @@ each call holds the send socket until its acknowledgement returns.
 | `on_close` | A client's send socket closes. Receives `OnCloseInfo`. |
 | `on_close_receive` | A client's receive socket closes. Receives `OnCloseInfo`. |
 | `on_finally` | Any client connection ends, for any reason. Receives `OnFinallyInfo`. |
+
+`Server` also takes `encryption` -- see [Encryption Modes](#-encryption-modes).
 
 Every callback, and `handler` itself, may be a normal function or an `async def`
 coroutine function. `OnOpenInfo` and `OnCloseInfo` carry a `client_id`;
@@ -262,9 +266,78 @@ This architecture allows the client and server to communicate in full-duplex mod
   - **On the Client**: The `Client` runs a background thread (or `asyncio` task) to listen for incoming messages on the receive socket. These messages are passed to your `on_receive` callback.
   - **On the Server**: The `Server` manages a pool of client connections. It receives a request from a client's "send" socket, processes it in your handler, and then queues the response to be sent back via that same client's "receive" socket.
 
-Messages are delimited on the wire by a byte token. Payloads are encrypted and
-compressed before framing, so your own data may contain any bytes, delimiters
-included.
+Messages are delimited on the wire by a byte token. Your own payloads may contain
+any bytes, delimiters included: `secure` and `faster` frame ciphertext, and `off`
+escapes the rare payload that contains the delimiter (see below).
+
+-----
+
+## ⚡ Encryption Modes
+
+Encryption is on by default. Pass `encryption=` to a `Client` or a `Server`, or set
+`BISOCKET_ENCRYPTION` for the whole process:
+
+```python
+server = bisocket.Server('0.0.0.0', 9000, handler, encryption='faster')
+client = bisocket.Client('10.0.0.5', 9000, on_receive, encryption='faster')
+```
+
+```bash
+export BISOCKET_ENCRYPTION=faster   # process-wide default
+```
+
+An explicit `encryption=` argument always wins over the environment variable.
+
+| Mode | Encrypted | Per-frame work | Use it when |
+| --- | --- | --- | --- |
+| `'secure'` *(default)* | AES-256-GCM | Encrypt, then `bz2` level 9 | You need the 0.0.8 wire format, e.g. while a fleet is mid-upgrade. |
+| `'faster'` | AES-256-GCM | Encrypt only | **Almost always.** Same protection as `secure`, dramatically cheaper. |
+| `'off'` | **No** | None | Throughput matters more than confidentiality *and* the network is fully trusted. |
+
+`True` / `False` are accepted as shorthand for `'secure'` / `'off'`.
+
+### Which mode should I use?
+
+**Use `'faster'`.** The `secure` pipeline compresses *after* encrypting, so its
+`bz2` pass is compressing ciphertext -- which is incompressible. It costs a great
+deal of CPU per frame and does not shrink anything; on a 1 MB payload it actually
+*adds* about 6 KB. Round-trip encode+decode of one frame, measured locally:
+
+| Payload | `'secure'` | `'faster'` | `'off'` |
+| --- | --- | --- | --- |
+| 200 B | 0.084 ms | 0.003 ms | 0.0004 ms |
+| 20 KB | 4.3 ms | 0.015 ms | 0.015 ms |
+| 1 MB | 220 ms | 0.7 ms | 0.9 ms |
+
+So `'faster'` is roughly **300x** cheaper than the default while sending slightly
+fewer bytes, and it gives up no confidentiality whatsoever. AES-GCM is
+hardware-accelerated and costs well under a millisecond per megabyte, which is why
+`'off'` buys almost nothing beyond `'faster'` -- and loses to it on large payloads,
+since it has to copy the buffer that AES-GCM would have transformed in place.
+
+Reach for `'off'` only for very small, very high-rate frames on a trusted network,
+where avoiding nonce generation is measurable.
+
+### ⚠️ Both ends must agree
+
+The three formats are not interchangeable. A `Client` and `Server` in different
+modes cannot talk, and the mismatch raises a `ValueError` naming the problem rather
+than failing obscurely. When changing the mode of a running system, either take a
+brief outage or move through `'secure'` (which is wire-compatible with 0.0.8) while
+rolling.
+
+### What `'off'` gives up
+
+With `encryption='off'` every frame goes out as plaintext, and a warning is printed
+once to stderr. Anything on the network path can read *and modify* traffic: you lose
+confidentiality and, because AES-GCM also authenticates, tamper detection. Only use
+it where the whole path is trusted -- a private VPC subnet, a container network, or
+loopback. `CRYPTO_KEY` is not read at all in this mode.
+
+Frames are otherwise sent byte-for-byte, with one exception: a payload that happens
+to contain the frame delimiter is base64-encoded so it cannot be mis-split. Each
+frame carries a one-byte tag saying which of the two applies, so the common case
+costs a single substring scan and one extra byte.
 
 -----
 
@@ -282,6 +355,9 @@ export CRYPTO_KEY=$(openssl rand -hex 32)
 ```
 
 If `CRYPTO_KEY` is not set, a default, insecure key (`'secret-lol'`) is used and a warning is printed to stderr. This is intended **only for local testing and development**.
+
+This section describes the `'secure'` and `'faster'` modes. With
+`encryption='off'` there is no encryption at all and none of it applies.
 
 Note the current limits of this model, which matter if you expose a server publicly:
 

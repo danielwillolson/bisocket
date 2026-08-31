@@ -21,6 +21,12 @@ OnCloseInfo = main.OnCloseInfo
 OnFinallyInfo = main.OnFinallyInfo
 ConnectionClosed = main.ConnectionClosed
 
+ENCRYPTION_SECURE = main.ENCRYPTION_SECURE
+ENCRYPTION_FASTER = main.ENCRYPTION_FASTER
+ENCRYPTION_OFF = main.ENCRYPTION_OFF
+ENCRYPTION_MODES = main.ENCRYPTION_MODES
+resolve_encryption = main.resolve_encryption
+
 BiClient = main.BiClient
 BiServer = main.BiServer
 BiMessage = main.BiMessage
@@ -35,5 +41,7 @@ __all__ = [
     'Client', 'Server', 'Message', 'ServerRequest', 'server_handler_example',
     'BiClient', 'BiServer', 'BiMessage', 'BiServerRequest',
     'OnOpenInfo', 'OnCloseInfo', 'OnFinallyInfo', 'ConnectionClosed',
+    'ENCRYPTION_SECURE', 'ENCRYPTION_FASTER', 'ENCRYPTION_OFF', 'ENCRYPTION_MODES',
+    'resolve_encryption',
     'VERSION', '__version__',
 ]
