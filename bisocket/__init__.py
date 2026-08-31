@@ -1,28 +1,39 @@
-# # Import modules from subpackages
-# try:
-#     from .cython import c_main as main 
-# except:
-#     from . import main
+"""bisocket: simple, secure, bidirectional Python sockets.
 
-# try:
-#     from .cython.c_main import (
-#         Client, Server, Message, ServerRequest, server_handler_example,
-#         BiClient, BiServer, BiMessage, BiServerRequest
-#     )
-# except:
-#     from .main import (
-#         Client, Server, Message, ServerRequest, server_handler_example,
-#         BiClient, BiServer, BiMessage, BiServerRequest
-#     )
+The Cython build of the library (bisocket.cython.c_main) is used when it was
+compiled at install time; otherwise the identical pure-Python bisocket.main is
+used. Both are generated from the same source, so behaviour does not change.
+"""
 
-from . import main
+try:
+    from .cython import c_main as main
+except ImportError:
+    from . import main
 
-from .main import (
-    Client, Server, Message, ServerRequest, server_handler_example,
-    BiClient, BiServer, BiMessage, BiServerRequest
-)
+Client = main.Client
+Server = main.Server
+Message = main.Message
+ServerRequest = main.ServerRequest
+server_handler_example = main.server_handler_example
+
+OnOpenInfo = main.OnOpenInfo
+OnCloseInfo = main.OnCloseInfo
+OnFinallyInfo = main.OnFinallyInfo
+ConnectionClosed = main.ConnectionClosed
+
+BiClient = main.BiClient
+BiServer = main.BiServer
+BiMessage = main.BiMessage
+BiServerRequest = main.BiServerRequest
+
+VERSION = main.VERSION
+__version__ = main.VERSION
 
 # Define the public API
 __all__ = [
     'main',
+    'Client', 'Server', 'Message', 'ServerRequest', 'server_handler_example',
+    'BiClient', 'BiServer', 'BiMessage', 'BiServerRequest',
+    'OnOpenInfo', 'OnCloseInfo', 'OnFinallyInfo', 'ConnectionClosed',
+    'VERSION', '__version__',
 ]

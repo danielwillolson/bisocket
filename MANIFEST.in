@@ -3,4 +3,13 @@ include LICENSE
 include requirements.txt
 include pyproject.toml
 
-graft bisocket/cython 
+include bisocket/cython/*.pyx
+include bisocket/cython/__init__.py
+
+# Never ship the generated C. Shipping it means Cython sees a .c newer than the
+# .pyx and skips regeneration, so the installed extension keeps the code from
+# whichever release the .c was generated from.
+global-exclude *.c
+global-exclude *.so
+global-exclude *.pyd
+global-exclude *.pyc

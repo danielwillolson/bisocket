@@ -1,7 +1,7 @@
 # `bisocket`: Simple, Secure, Bidirectional Python Sockets
 
-[](https://www.google.com/search?q=https://badge.fury.io/py/bisocket)
-[](https://opensource.org/licenses/MIT)
+[![PyPI](https://img.shields.io/pypi/v/bisocket.svg)](https://pypi.org/project/bisocket/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 `bisocket` is a high-level Python library that simplifies bidirectional (two-way) communication over sockets. It provides a robust framework for building client-server applications that require sending and receiving data simultaneously without blocking.
 
@@ -17,6 +17,7 @@ It comes with built-in **AES-GCM end-to-end encryption** and **bz2 compression**
   - **Sync & Async Support**: Provides both a standard threading API and a modern `asyncio` API.
   - **Simple Handler-Based API**: Use a clean handler function on the server and an `on_receive` callback on the client to process messages.
   - **Unique Client Identification**: Manages clients using unique UUIDs, making it easy to track connections.
+  - **Connection Lifecycle Hooks**: Optional `on_open`, `on_close` and `on_finally` callbacks on the server.
 
 -----
 
@@ -28,17 +29,26 @@ Install `bisocket` directly from PyPI:
 pip install bisocket
 ```
 
-The only dependency is the `cryptography` library for encryption.
+The only runtime dependency is the `cryptography` library for encryption.
+
+If Cython and a C compiler are available at install time, a compiled build of the
+library is used automatically. If they are not, the install still succeeds and the
+identical pure-Python implementation is used instead. Both are built from the same
+source, so behaviour does not differ. To see which one you got:
+
+```bash
+python -c "import bisocket; print(bisocket.main.__file__)"
+```
 
 -----
 
 ## 🚀 Quick Start
 
-Here’s a simple echo client and server to get you started.
+Here's a simple echo client and server to get you started.
 
 ### 1\. Set the Encryption Key
 
-For security, `bisocket` requires an encryption key. Set it as an environment variable. If it's not set, the library will use a default, **insecure** key suitable only for testing.
+For security, `bisocket` requires an encryption key. Set it as an environment variable. If it's not set, the library prints a warning and falls back to a default, **insecure** key suitable only for testing.
 
 ```bash
 export CRYPTO_KEY='your-super-secret-and-long-encryption-key'
@@ -81,17 +91,17 @@ def on_receive(msg: Message):
 # Use the Client as a context manager for clean connection handling.
 with Client(host='127.0.0.1', port=65432, on_receive=on_receive) as client:
     print("Client connected.")
-    
+
     # Send an 'echo' request.
     request_id_1 = client.send('echo', b'Hello, World!')
     print(f"Sent 'echo' request with ID: {request_id_1}")
-    
+
     time.sleep(1) # Wait for the response.
-    
+
     # Send a 'ping' request.
     request_id_2 = client.send('ping', b'')
     print(f"Sent 'ping' request with ID: {request_id_2}")
-    
+
     time.sleep(2) # Give time for messages to be processed before exiting.
 
 print("Client disconnected.")
@@ -100,6 +110,11 @@ print("Client disconnected.")
 -----
 
 ### 3\. Asynchronous Example
+
+Use `Server.astart()` and the client's `aopen()` / `asend()` / `aclose()` (or `async with`)
+for the asyncio API. An `async def` handler works with either server, but the
+synchronous `Server.start()` has to spin up an event loop per call, so prefer
+`astart()` when your handler is a coroutine.
 
 #### Async Server (`async_server.py`)
 
@@ -110,7 +125,7 @@ from bisocket import Server, ServerRequest
 # Define an async handler for non-blocking operations.
 async def ahandler(request: ServerRequest):
     print(f"Received method '{request.method}' with data: {request.data.decode()}")
-    
+
     if request.method == 'echo':
         await asyncio.sleep(0.5) # Simulate I/O-bound work.
         request.send_data(request.data)
@@ -142,7 +157,7 @@ async def main():
     # Use the async context manager for the client.
     async with Client(host='127.0.0.1', port=65432, on_receive=aon_receive) as client:
         print("Async client connected.")
-        
+
         # Send multiple requests concurrently.
         tasks = [
             client.asend('echo', b'First async message'),
@@ -150,12 +165,86 @@ async def main():
         ]
         request_ids = await asyncio.gather(*tasks)
         print(f"Sent requests with IDs: {request_ids}")
-        
+
         await asyncio.sleep(2) # Keep client running to receive responses.
 
 if __name__ == "__main__":
     asyncio.run(main())
 ```
+
+-----
+
+## 📚 API Reference
+
+### `Client(host, port, on_receive)`
+
+`on_receive` is called with a `Message` for every message pushed by the server. It
+may be a normal function or an `async def` coroutine function.
+
+| Method | Description |
+| --- | --- |
+| `open()` / `close()` | Connect and disconnect. Also available as a `with` block. |
+| `aopen()` / `aclose()` | Async equivalents. Also available as an `async with` block. |
+| `send(method, data) -> str` | Send `bytes` under a method name; returns the request ID. |
+| `send_obj(method, obj) -> str` | Same, but JSON-encodes `obj` first. |
+| `asend(...)` / `asend_obj(...)` | Async equivalents. |
+| `ping()` / `aping()` | Raise `ConnectionError` if either socket has dropped. |
+
+`send()` and `asend()` are safe to call concurrently from multiple threads or tasks;
+each call holds the send socket until its acknowledgement returns.
+
+### `Message`
+
+| Attribute / Method | Description |
+| --- | --- |
+| `request_id: str` | ID of the request this message answers. |
+| `data: bytes` | Raw payload. |
+| `get_str() -> str` | Payload decoded as UTF-8. |
+| `get_obj()` | Payload parsed as JSON. |
+
+### `Server(host, port, handler, ...)`
+
+| Argument | Called when |
+| --- | --- |
+| `handler` | A request arrives. Receives a `ServerRequest`. |
+| `on_open` | A client's send socket connects. Receives `OnOpenInfo`. |
+| `on_open_receive` | A client's receive socket connects. Receives `OnOpenInfo`. |
+| `on_close` | A client's send socket closes. Receives `OnCloseInfo`. |
+| `on_close_receive` | A client's receive socket closes. Receives `OnCloseInfo`. |
+| `on_finally` | Any client connection ends, for any reason. Receives `OnFinallyInfo`. |
+
+Every callback, and `handler` itself, may be a normal function or an `async def`
+coroutine function. `OnOpenInfo` and `OnCloseInfo` carry a `client_id`;
+`OnFinallyInfo` carries `client_id: str | None`, which is `None` if the connection
+failed before the client identified itself.
+
+Because each client opens two sockets, `on_finally` fires twice per client — once
+per connection.
+
+| Method | Description |
+| --- | --- |
+| `start()` | Run the threaded server. Blocks forever. |
+| `astart()` | Run the asyncio server. Blocks forever. |
+
+### `ServerRequest`
+
+| Attribute / Method | Description |
+| --- | --- |
+| `client_id: str` | UUID of the sending client. |
+| `request_id: str` | UUID of this request. |
+| `method: str` | Method name the client sent. |
+| `data: bytes` | Raw payload. |
+| `send_data(data: bytes)` | Queue a `bytes` response back to that client. |
+| `send(data: str)` | Same, for a `str`. |
+
+A handler may call `send_data()` any number of times, including zero. Responses are
+pushed over the client's receive socket, so they are not tied to a request/response
+turn.
+
+### Aliases
+
+`BiClient`, `BiServer`, `BiMessage` and `BiServerRequest` are aliases for `Client`,
+`Server`, `Message` and `ServerRequest`.
 
 -----
 
@@ -173,6 +262,10 @@ This architecture allows the client and server to communicate in full-duplex mod
   - **On the Client**: The `Client` runs a background thread (or `asyncio` task) to listen for incoming messages on the receive socket. These messages are passed to your `on_receive` callback.
   - **On the Server**: The `Server` manages a pool of client connections. It receives a request from a client's "send" socket, processes it in your handler, and then queues the response to be sent back via that same client's "receive" socket.
 
+Messages are delimited on the wire by a byte token. Payloads are encrypted and
+compressed before framing, so your own data may contain any bytes, delimiters
+included.
+
 -----
 
 ## 🔐 Security
@@ -188,7 +281,15 @@ You can generate a cryptographically secure key using OpenSSL:
 export CRYPTO_KEY=$(openssl rand -hex 32)
 ```
 
-If `CRYPTO_KEY` is not set, a default, insecure key (`'secret-lol'`) is used, and a warning is printed. This is intended **only for local testing and development**.
+If `CRYPTO_KEY` is not set, a default, insecure key (`'secret-lol'`) is used and a warning is printed to stderr. This is intended **only for local testing and development**.
+
+Note the current limits of this model, which matter if you expose a server publicly:
+
+  - Every client shares one symmetric key, so any client that can connect can read
+    and forge any other client's traffic. There is no per-client authentication.
+  - `client_id` is chosen by the client and is not verified.
+  - The key is derived by a single SHA-256 pass, not a slow KDF, so a weak
+    `CRYPTO_KEY` is cheap to brute force. Use a long random value.
 
 -----
 

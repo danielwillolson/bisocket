@@ -1,4 +1,5 @@
 import os
+import sys
 import bz2
 import uuid
 import time
@@ -6,6 +7,7 @@ import json
 import socket
 import inspect
 import asyncio
+import weakref
 import traceback
 import threading
 import queue
@@ -17,54 +19,90 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.backends import default_backend
 
 
-VERSION = '0.0.0'
+VERSION = '0.0.7'
 END_TOKEN = b'|[-_-]|'
 SPLIT_TOKEN = b'|(---)|'
 SPLIT_TOKEN2 = b'|{***}|'
 LENGTH_OF_END_TOKEN = len(END_TOKEN)
+RECV_SIZE = 65536
+CLIENT_TEARDOWN_TIMEOUT = 30.0
+DEFAULT_CRYPTO_KEY = 'secret-lol'
+SHUTDOWN_TIMEOUT = 5.0
+
+
+class ConnectionClosed(ConnectionError):
+    """The peer went away before a complete frame arrived."""
+
+
+# A single recv() can return more than one frame, and the bytes past the first
+# END_TOKEN belong to the next frame. They are kept per connection so the next
+# receive() picks up where this one stopped instead of discarding them.
+_recv_buffers: 'weakref.WeakKeyDictionary[socket.socket, bytes]' = weakref.WeakKeyDictionary()
+
+
+def _split_frame(conn: socket.socket, buffer: bytes) -> bytes | None:
+    """Return the first complete frame in `buffer`, stashing the remainder."""
+    index = buffer.find(END_TOKEN)
+    if index == -1:
+        return None
+    _recv_buffers[conn] = buffer[index + LENGTH_OF_END_TOKEN:]
+    return buffer[:index]
 
 
 def receive(conn: socket.socket) -> bytes:
-    data = b''
-    while not data.endswith(END_TOKEN):
-        v = conn.recv(1024)
-        if not v:
-            # If the connection is closed, we'll break out of the loop
-            break
-        data += v
+    buffer = _recv_buffers.get(conn, b'')
 
-    if not data.endswith(END_TOKEN):
-        # If we broke out of the loop and don't have the end token,
-        # it means the connection was closed prematurely.
-        try:
-            decoded_data = data.decode()
-        except UnicodeDecodeError:
-            decoded_data = repr(data)
-        
-        return decoded_data
-        raise ValueError(f'Invalid value received: `{decoded_data}`')
+    while True:
+        frame = _split_frame(conn, buffer)
+        if frame is not None:
+            return frame
 
-    return data[:-LENGTH_OF_END_TOKEN]
+        chunk = conn.recv(RECV_SIZE)
+        if not chunk:
+            _recv_buffers.pop(conn, None)
+            raise ConnectionClosed(f'Connection closed after {len(buffer)} byte(s) of an incomplete frame')
+        buffer += chunk
+
+
+_crypto_key_warned = False
+
+
+def get_crypto_key() -> str:
+    """Read CRYPTO_KEY, warning once if the insecure development default is used."""
+    global _crypto_key_warned
+
+    key = os.environ.get('CRYPTO_KEY')
+    if key:
+        return key
+
+    if not _crypto_key_warned:
+        _crypto_key_warned = True
+        print(
+            'WARNING: CRYPTO_KEY is not set, falling back to the default insecure key. '
+            'Set CRYPTO_KEY before using bisocket outside of local development.',
+            file=sys.stderr,
+        )
+    return DEFAULT_CRYPTO_KEY
 
 
 def send(conn: socket.socket, data: bytes) -> None:
     conn.sendall(data+END_TOKEN)
 
 
-async def async_receive(sock: socket.socket) -> bytes | str:
+async def async_receive(sock: socket.socket) -> bytes:
     loop = asyncio.get_running_loop()
-    data = b''
+    buffer = _recv_buffers.get(sock, b'')
 
-    while not data.endswith(END_TOKEN):
-        chunk = await loop.sock_recv(sock, 1024)
-        if not chunk:  # connection closed
-            try:
-                return data.decode()
-            except UnicodeDecodeError:
-                return repr(data)
-        data += chunk
+    while True:
+        frame = _split_frame(sock, buffer)
+        if frame is not None:
+            return frame
 
-    return data[:-LENGTH_OF_END_TOKEN]
+        chunk = await loop.sock_recv(sock, RECV_SIZE)
+        if not chunk:
+            _recv_buffers.pop(sock, None)
+            raise ConnectionClosed(f'Connection closed after {len(buffer)} byte(s) of an incomplete frame')
+        buffer += chunk
 
 
 async def async_send(sock: socket.socket, data: bytes) -> None:
@@ -145,7 +183,7 @@ class EncryptedData:
     
     @classmethod
     def from_bytes(cls, data: bytes) -> 'EncryptedData':
-        data, iv = decompress_bytes(data).split(SPLIT_TOKEN2)
+        data, iv = decompress_bytes(data).rsplit(SPLIT_TOKEN2, 1)
         return cls(
             data=data,
             iv=iv,
@@ -184,9 +222,9 @@ class EncryptionService:
 
         return self.encrypt_data(data_bytes)
 
-    def decrypt_obj(self, encrypted: bytes, iv: bytes) -> dict:
+    def decrypt_obj(self, encrypted_data: EncryptedData) -> dict:
         """Decrypt data using AES-GCM"""
-        return json.loads(self.decrypt_data(encrypted, iv).decode())
+        return json.loads(self.decrypt_data(encrypted_data).decode())
 
     def encrypt_data(self, data: bytes) -> EncryptedData:
         """Encrypt data using AES-GCM"""
@@ -233,8 +271,7 @@ class Client:
         # Initialize encryption service
         self.client_id = str(uuid.uuid4())
 
-        crypto_key = os.environ.get('CRYPTO_KEY', 'secret-lol')
-        self.encryption_service = EncryptionService(crypto_key)
+        self.encryption_service = EncryptionService(get_crypto_key())
 
         self.host = host
         self.port = port
@@ -253,6 +290,12 @@ class Client:
         self.receiving_task: threading.Thread | None = None
         self._receiving_task: asyncio.Task | None = None
 
+        # One request occupies the send socket until its ack comes back, so
+        # concurrent send()/asend() calls have to take turns.
+        self._send_lock = threading.Lock()
+        self._asend_lock = asyncio.Lock()
+        self._loop: asyncio.AbstractEventLoop | None = None
+
     def __enter__(self):
         self.open()
         return self
@@ -270,49 +313,47 @@ class Client:
     def send(self, method: str, data: bytes) -> str:
         # self.ping()
         request_id = str(uuid.uuid4())
-        send(self.send_conn, self.encrypt(SPLIT_TOKEN.join([method.encode(), request_id.encode(), data])))
-        receive(self.send_conn)
+        with self._send_lock:
+            send(self.send_conn, self.encrypt(SPLIT_TOKEN.join([method.encode(), request_id.encode(), data])))
+            receive(self.send_conn)
         return request_id
     
     def send_obj(self, method: str, data: dict | list | int | float | bool | str | None) -> str:
         return self.send(method, json.dumps(data).encode())
 
-    def __receive_thread(self) -> bytes:
-        while self.receiving:
+    def __receive_thread(self) -> None:
+        while (data := self.receive_queue.get()) is not None:
             try:
-                while (data := self.receive_queue.get()) is not None:
-                    if data:
-                        request_id, data = self.decrypt(data).split(SPLIT_TOKEN)
+                if not data:
+                    continue
 
-                        if data == b'__close__':
-                            # print('close!', request_id, data)
-                            break
+                # maxsplit=1: the payload is the last field and may itself
+                # contain SPLIT_TOKEN.
+                request_id, data = self.decrypt(data).split(SPLIT_TOKEN, 1)
 
-                        msg = Message(request_id.decode(), data)
-                        self.on_receive(msg)
+                if data == b'__close__':
+                    break
+
+                run_maybe_async(self.on_receive, Message(request_id.decode(), data))
             except Exception as e:
-                print(f'Error receiving data: {e}')
+                print(f'Error handling received data: {e}')
                 traceback.print_exc()
                 break
     
-    def _receive_thread(self) -> bytes:
+    def _receive_thread(self) -> None:
         while self.receiving:
             try:
                 data = receive(self.receive_conn)
-                if data:
-                    self.receive_queue.put(data)
-                    # request_id, data = self.decrypt(data).split(SPLIT_TOKEN)
-
-                    # if data == b'__close__':
-                    #     print('close!', request_id, data)
-                    #     break
-
-                    # msg = Message(request_id.decode(), data)
-                    # self.on_receive(msg)
+            except (ConnectionClosed, OSError):
+                # Peer hung up. Stop, rather than spinning on a dead socket.
+                break
             except Exception as e:
                 print(f'Error receiving data: {e}')
                 traceback.print_exc()
                 break
+
+            if data:
+                self.receive_queue.put(data)
         self.receive_queue.put(None)
 
     @staticmethod
@@ -359,25 +400,29 @@ class Client:
         assert b'ok' == self.decrypt(receive(self.send_conn))
 
     def close(self) -> None:
-        self.send('close', b'closing')
-        assert self.decrypt(self.server_receive(self.send_conn)) == b'__close__'
-        self.send_conn.close()
+        try:
+            self.send('close', b'closing')
+            assert self.decrypt(self.server_receive(self.send_conn)) == b'__close__'
+        finally:
+            self.receiving = False
 
-        self.receiving = False
-        if self.receiving_thread:
-            self.receiving_thread.join()
+            # The reader thread is parked in a blocking recv(); shut the socket
+            # down so it returns instead of the join() below hanging on it.
+            shutdown_socket(self.receive_conn)
+
+            for thread in (self.receiving_thread, self._receiving_thread):
+                if thread:
+                    thread.join(timeout=SHUTDOWN_TIMEOUT)
             self.receiving_thread = None
-
-        if self._receive_thread:
-            self._receiving_thread.join()
             self._receiving_thread = None
-            
-        self.receive_conn.close()
+
+            if self.send_conn:
+                self.send_conn.close()
+            if self.receive_conn:
+                self.receive_conn.close()
     
     def server_receive(self, s):
-        while not (data := receive(s)):
-            pass
-        return data
+        return receive(s)
 
     async def __aenter__(self):
         await self.aopen()
@@ -398,55 +443,53 @@ class Client:
     async def asend(self, method: str, data: bytes) -> str:
         # await self.aping()
         request_id = str(uuid.uuid4())
-        await async_send(self.send_conn, await self.aencrypt(SPLIT_TOKEN.join([method.encode(), request_id.encode(), data])))
-        await async_receive(self.send_conn)
+        async with self._asend_lock:
+            await async_send(self.send_conn, await self.aencrypt(SPLIT_TOKEN.join([method.encode(), request_id.encode(), data])))
+            await async_receive(self.send_conn)
         return request_id
     
     async def asend_obj(self, method: str, data: dict | list | int | float | bool | str | None) -> str:
         return await self.asend(method, json.dumps(data).encode())
 
-    async def __areceive_thread(self) -> bytes:
-        while self.receiving:
+    async def __areceive_thread(self) -> None:
+        while (data := await self.areceive_queue.get()) is not None:
             try:
-                while (data := await self.areceive_queue.get()) is not None:
-                    if data:
-                        request_id, data = (await self.adecrypt(data)).split(SPLIT_TOKEN)
+                if not data:
+                    continue
 
-                        if data == b'__close__':
-                            # print('close!', request_id, data)
-                            break
+                request_id, data = (await self.adecrypt(data)).split(SPLIT_TOKEN, 1)
 
-                        msg = Message(request_id.decode(), data)
-                        
-                        if inspect.iscoroutinefunction(self.on_receive):
-                            await self.on_receive(msg)
-                        else:
-                            # self.on_receive(msg)
-                            await asyncio.to_thread(self.on_receive, msg)
+                if data == b'__close__':
+                    break
+
+                await run_as_async(self.on_receive, Message(request_id.decode(), data))
             except Exception as e:
-                print(f'Error receiving data: {e}')
+                print(f'Error handling received data: {e}')
                 traceback.print_exc()
                 break
     
-    def _areceive_thread(self) -> bytes:
+    def _areceive_thread(self) -> None:
+        # Runs in a worker thread; asyncio.Queue is not thread safe, so every
+        # hand-off has to go through the loop.
+        def put(item):
+            try:
+                self._loop.call_soon_threadsafe(self.areceive_queue.put_nowait, item)
+            except RuntimeError:
+                pass  # loop already closed
+
         while self.receiving:
             try:
                 data = receive(self.receive_conn)
-                if data:
-                    self.areceive_queue.put_nowait(data)
-                    # request_id, data = self.decrypt(data).split(SPLIT_TOKEN)
-
-                    # if data == b'__close__':
-                    #     print('close!', request_id, data)
-                    #     break
-
-                    # msg = Message(request_id.decode(), data)
-                    # self.on_receive(msg)
+            except (ConnectionClosed, OSError):
+                break
             except Exception as e:
                 print(f'Error receiving data: {e}')
                 traceback.print_exc()
                 break
-        self.areceive_queue.put_nowait(None)
+
+            if data:
+                put(data)
+        put(None)
 
     @staticmethod
     async def ais_socket_healthy(sock):
@@ -470,6 +513,7 @@ class Client:
     
     async def aopen(self) -> None:
         loop = asyncio.get_running_loop()
+        self._loop = loop
 
         def receive_socket_setup():
             self.receive_conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -502,31 +546,60 @@ class Client:
         assert b'ok' == await self.adecrypt(await async_receive(self.send_conn))
 
     async def aclose(self) -> None:
-        await self.asend('close', b'closing')
-        assert (await self.adecrypt(await self.aserver_receive(self.send_conn))) == b'__close__'
-        self.send_conn.close()
+        try:
+            await self.asend('close', b'closing')
+            assert (await self.adecrypt(await self.aserver_receive(self.send_conn))) == b'__close__'
+        finally:
+            self.receiving = False
+            shutdown_socket(self.receive_conn)
 
-        self.receiving = False
-        if self.receiving_task:
-            self.receiving_task.join()
-            self.receiving_task = None
+            if self.receiving_task:
+                # join() in a worker thread; blocking it here would stop the
+                # loop that the reader thread needs in order to finish.
+                await asyncio.to_thread(self.receiving_task.join, SHUTDOWN_TIMEOUT)
+                self.receiving_task = None
 
-        if self._receiving_task:
-            await self._receiving_task
-            self._receiving_task = None
+            if self._receiving_task:
+                try:
+                    await asyncio.wait_for(self._receiving_task, timeout=SHUTDOWN_TIMEOUT)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    self._receiving_task.cancel()
+                self._receiving_task = None
 
-        self.receive_conn.close()
+            if self.send_conn:
+                self.send_conn.close()
+            if self.receive_conn:
+                self.receive_conn.close()
     
     async def aserver_receive(self, s):
-        while not (data := await async_receive(s)):
-            pass
-        return data
+        return await async_receive(s)
 
 
 async def run_as_async(func, *args, **kwargs) -> Any:
     if inspect.iscoroutinefunction(func):
         return await func(*args, **kwargs)
     return await asyncio.to_thread(func, *args, **kwargs)
+
+
+def run_maybe_async(func, *args, **kwargs) -> Any:
+    """Call `func` from synchronous code, awaiting it if it is a coroutine function.
+
+    Without this a user handler defined with `async def` would only ever produce a
+    coroutine object that nobody awaits, so its body would silently never run.
+    """
+    if inspect.iscoroutinefunction(func):
+        return asyncio.run(func(*args, **kwargs))
+    return func(*args, **kwargs)
+
+
+def shutdown_socket(sock: socket.socket | None) -> None:
+    """Unblock any thread parked in recv() on `sock`; closing alone may not."""
+    if sock is None:
+        return
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
 
 
 @dataclass
@@ -551,6 +624,11 @@ class OnCloseInfo:
     client_id: str
 
 
+@dataclass
+class OnFinallyInfo:
+    client_id: str | None
+
+
 class Server:
     def __init__(
             self, 
@@ -562,6 +640,8 @@ class Server:
 
             on_open: Callable[[OnOpenInfo], None | Awaitable[None]] = None,
             on_open_receive: Callable[[OnOpenInfo], None | Awaitable[None]] = None,
+
+            on_finally: Callable[[OnFinallyInfo], None | Awaitable[None]] = None,
         ):
         self.host = host
         self.port = port
@@ -570,12 +650,12 @@ class Server:
         self.on_close_receive: Callable[[OnCloseInfo], None | Awaitable[None]] = on_close_receive
         self.on_open: Callable[[OnOpenInfo], None | Awaitable[None]] = on_open
         self.on_open_receive: Callable[[OnOpenInfo], None | Awaitable[None]] = on_open_receive
+        self.on_finally: Callable[[OnFinallyInfo], None | Awaitable[None]] = on_finally
 
-        self.client_queue: list[str, queue.Queue | asyncio.Queue] = {}
-        self.client_send_socket: list[str, queue.Queue] = {}
+        self.client_queue: dict[str, queue.Queue | asyncio.Queue] = {}
+        self.client_send_socket: dict[str, socket.socket] = {}
 
-        crypto_key = os.environ.get('CRYPTO_KEY', 'secret-lol')
-        self.encryption_service = EncryptionService(crypto_key)
+        self.encryption_service = EncryptionService(get_crypto_key())
 
     def encrypt(self, data: bytes) -> bytes:
         return self.encryption_service.encrypt_data(data).to_bytes()
@@ -607,9 +687,9 @@ class Server:
                 client_thread = threading.Thread(target=self.handle_client, args=(client_socket,), daemon=True)
                 client_thread.start()
         finally:
-            server.shutdown(socket.SHUT_RDWR)
+            # shutdown() on a listening socket raises ENOTCONN and would mask
+            # whatever exception actually broke the accept loop.
             server.close()
-            exit()
     
     def server_receive(self, s):
         while not (data := receive(s)):
@@ -617,109 +697,146 @@ class Server:
         return data
     
     def handle_requests(self, client_id: str, s, q: queue.Queue, request_q: queue.Queue, loop=None):
-        method, request_id, data = self.decrypt(self.server_receive(s)).split(SPLIT_TOKEN)  
-        send(s, b'ok')
+        # This always runs in a worker thread. When `loop` is set the queues are
+        # asyncio queues owned by that loop, and asyncio queues are not thread
+        # safe, so every put has to be routed back through the loop.
+        def put(target_q, item):
+            if loop:
+                loop.call_soon_threadsafe(target_q.put_nowait, item)
+            else:
+                target_q.put_nowait(item)
 
-        while method != b'close':
-            def get_send_data_func(req_id: bytes):
-                def send_data(data: bytes) -> None:
-                    q.put_nowait(SPLIT_TOKEN.join([req_id, data]))
-                return send_data
-                
-            request_q.put_nowait(
-                ServerRequest(
-                    client_id,
-                    request_id.decode(),
-                    method.decode(), 
-                    data, 
-                    get_send_data_func(request_id)
-                )
-            )
-            # self.handler(ServerRequest(method.decode(), data, send_data))
-            method, request_id, data = self.decrypt(self.server_receive(s)).split(SPLIT_TOKEN)
+        def get_send_data_func(req_id: bytes):
+            def send_data(data: bytes) -> None:
+                put(q, SPLIT_TOKEN.join([req_id, data]))
+            return send_data
+
+        try:
+            # maxsplit=2: the payload is the last field and may contain SPLIT_TOKEN.
+            method, request_id, data = self.decrypt(self.server_receive(s)).split(SPLIT_TOKEN, 2)
             send(s, b'ok')
-        
-        if loop:
-            loop.call_soon_threadsafe(request_q.put_nowait, None)
-        else:
-            request_q.put_nowait(None)
+
+            while method != b'close':
+                put(
+                    request_q,
+                    ServerRequest(
+                        client_id,
+                        request_id.decode(),
+                        method.decode(),
+                        data,
+                        get_send_data_func(request_id)
+                    )
+                )
+                method, request_id, data = self.decrypt(self.server_receive(s)).split(SPLIT_TOKEN, 2)
+                send(s, b'ok')
+        except (ConnectionClosed, OSError):
+            pass  # client went away; fall through and stop the handler loop
+        except Exception as e:
+            print(f'Error handling requests from {client_id}: {e}')
+            traceback.print_exc()
+        finally:
+            put(request_q, None)
         
         
     def handle_client(self, s):
-        with s:
-            client_type, client_id = self.decrypt(receive(s)).split(SPLIT_TOKEN)
-            client_id = client_id.decode()
+        client_id = None
+        try:
+            with s:
+                client_type, client_id = self.decrypt(receive(s)).split(SPLIT_TOKEN, 1)
+                client_id = client_id.decode()
 
-            if client_type == b'send':
+                if client_type == b'send':
+                    try:
+                        request_q: queue.Queue = queue.Queue()
+                        
+                        q: queue.Queue = queue.Queue()
+                        self.client_queue[client_id] = q
+                        self.client_send_socket[client_id] = s
+
+                        if callable(self.on_open):
+                            run_maybe_async(self.on_open, OnOpenInfo(client_id))
+
+                        send(s, self.encrypt(b'ok'))
+
+                        # method, request_id, data = self.decrypt(self.server_receive(s)).split(SPLIT_TOKEN)
+                        # while method != b'close':
+                        #     def send_data(data: bytes) -> None:
+                        #         q.put(SPLIT_TOKEN.join([request_id, data]))
+                        #     self.handler(ServerRequest(method.decode(), data, send_data))
+                        #     method, request_id, data = self.decrypt(self.server_receive(s)).split(SPLIT_TOKEN)
+
+                        t = threading.Thread(target=self.handle_requests, args=(client_id, s, q, request_q), daemon=True)
+                        t.start()
+
+                        while (request := request_q.get()) is not None:
+                            request: ServerRequest
+                            # print('handling', request)
+                            run_maybe_async(self.handler, request)
+
+                        q.put(b'close')
+                        # Wait for the receive side to drain, but do not park
+                        # this thread forever if that client never shows up.
+                        deadline = time.time() + CLIENT_TEARDOWN_TIMEOUT
+                        while client_id in self.client_send_socket and time.time() < deadline:
+                            time.sleep(0.1)
+                    finally:
+                        self.client_queue.pop(client_id, None)
+                        self.client_send_socket.pop(client_id, None)
+                        if callable(self.on_close):
+                            try:
+                                run_maybe_async(self.on_close, OnCloseInfo(client_id))
+                            except Exception as e:
+                                print(f'Error in on_close: {e}')
+                                traceback.print_exc()
+                elif client_type == b'receive':
+                    try:
+                        if callable(self.on_open_receive):
+                            run_maybe_async(self.on_open_receive, OnOpenInfo(client_id))
+                        send(s, self.encrypt(b'ok'))
+
+                        t = time.time()
+                        while client_id not in self.client_queue:
+                            time.sleep(0.1)
+                            if time.time() - t > 60:
+                                raise ValueError('Timeout waiting for client queue')
+                        
+                        # No annotation: `q` is already bound in the send branch
+                        # above, and Cython rejects a second declaration.
+                        q = self.client_queue[client_id]
+
+                        while (data := q.get()) != b'close':
+                            if data:
+                                send(s, self.encrypt(data))
+                                
+                        send(s, self.encrypt(SPLIT_TOKEN.join([b'empty-id', b'__close__'])))
+                    finally:
+                        # Unregister even if the client vanished mid-write,
+                        # otherwise these dicts grow for every dropped client.
+                        self.client_queue.pop(client_id, None)
+                        send_socket = self.client_send_socket.pop(client_id, None)
+                        if send_socket is not None:
+                            try:
+                                send(send_socket, self.encrypt(b'__close__'))
+                            except OSError:
+                                pass  # client already gone
+
+                        if callable(self.on_close_receive):
+                            try:
+                                run_maybe_async(self.on_close_receive, OnCloseInfo(client_id))
+                            except Exception as e:
+                                print(f'Error in on_close_receive: {e}')
+                                traceback.print_exc()
+                # method, data = receive(s).split(SPLIT_TOKEN)
+        except (ConnectionClosed, OSError) as e:
+            # A client dropping its connection is routine, not a crash.
+            print(f'Client {client_id} disconnected: {e}')
+        finally:
+            if callable(self.on_finally):
                 try:
-                    request_q: queue.Queue = queue.Queue()
-                    
-                    q: queue.Queue = queue.Queue()
-                    self.client_queue[client_id] = q
-                    self.client_send_socket[client_id] = s
-
-                    if callable(self.on_open):
-                        self.on_open(OnOpenInfo(client_id))
-
-                    send(s, self.encrypt(b'ok'))
-
-                    # method, request_id, data = self.decrypt(self.server_receive(s)).split(SPLIT_TOKEN)
-                    # while method != b'close':
-                    #     def send_data(data: bytes) -> None:
-                    #         q.put(SPLIT_TOKEN.join([request_id, data]))
-                    #     self.handler(ServerRequest(method.decode(), data, send_data))
-                    #     method, request_id, data = self.decrypt(self.server_receive(s)).split(SPLIT_TOKEN)
-
-                    t = threading.Thread(target=self.handle_requests, args=(client_id, s, q, request_q), daemon=True)
-                    t.start()
-
-                    while (request := request_q.get()) is not None:
-                        request: ServerRequest
-                        # print('handling', request)
-                        self.handler(request)
-
-                    q.put(b'close')
-                    while client_id in self.client_send_socket:
-                        time.sleep(1.0)
-                finally:
-                    if callable(self.on_close):
-                        try:
-                            self.on_close(OnCloseInfo(client_id))
-                        except Exception as e:
-                            print(f'Error in on_close: {e}')
-                            traceback.print_exc()
-            elif client_type == b'receive':
-                try:
-                    if callable(self.on_open_receive):
-                        self.on_open_receive(OnOpenInfo(client_id))
-                    send(s, self.encrypt(b'ok'))
-
-                    t = time.time()
-                    while client_id not in self.client_queue:
-                        time.sleep(0.1)
-                        if time.time() - t > 60:
-                            raise ValueError('Timeout waiting for client queue')
-                    
-                    q: queue.Queue = self.client_queue[client_id]
-
-                    while (data := q.get()) != b'close':
-                        if data:
-                            send(s, self.encrypt(data))
-                            
-                    send(s, self.encrypt(SPLIT_TOKEN.join([b'empty-id', b'__close__'])))
-                    
-                    del self.client_queue[client_id]
-                    send(self.client_send_socket[client_id], self.encrypt(b'__close__'))
-                    del self.client_send_socket[client_id]
-                    time.sleep(1.0)
-                finally:
-                    if callable(self.on_close_receive):
-                        try:
-                            self.on_close_receive(OnCloseInfo(client_id))
-                        except Exception as e:
-                            print(f'Error in on_close_receive: {e}')
-                            traceback.print_exc()
-            # method, data = receive(s).split(SPLIT_TOKEN)
+                    run_maybe_async(self.on_finally, OnFinallyInfo(client_id))
+                except Exception as e:
+                    print(f'Error in on_finally: {e}')
+                    traceback.print_exc()
 
     async def aencrypt(self, data: bytes) -> bytes:
         return await asyncio.to_thread(self.encrypt, data)
@@ -757,9 +874,7 @@ class Server:
                 client_socket.setblocking(False)
                 asyncio.create_task(self.ahandle_client(client_socket))
         finally:
-            server.shutdown(socket.SHUT_RDWR)
             server.close()
-            exit()
     
     async def aserver_receive(self, s):
         while not (data := await async_receive(s)):
@@ -767,7 +882,8 @@ class Server:
         return data
     
     async def ahandle_requests(self, client_id: str, s, q: asyncio.Queue, request_q: asyncio.Queue):
-        method, request_id, data = (await self.adecrypt(await self.aserver_receive(s))).split(SPLIT_TOKEN)
+        method, request_id, data = (await self.adecrypt(await self.aserver_receive(s))).split(SPLIT_TOKEN, 2)
+        await async_send(s, b'ok')
 
         while method != b'close':
             # async def send_data(data: bytes) -> None:
@@ -779,91 +895,102 @@ class Server:
                 
             await request_q.put(ServerRequest(client_id, request_id.decode(), method.decode(), data, get_send_data_func(request_id)))
             # self.handler(ServerRequest(method.decode(), data, send_data))
-            method, request_id, data = (await self.adecrypt(await self.aserver_receive(s))).split(SPLIT_TOKEN)
+            method, request_id, data = (await self.adecrypt(await self.aserver_receive(s))).split(SPLIT_TOKEN, 2)
+            await async_send(s, b'ok')
         
         await request_q.put(None)
         
         
     async def ahandle_client(self, s: socket.socket):
-        with s:
-            client_type, client_id = (await self.adecrypt(await async_receive(s))).split(SPLIT_TOKEN)
-            client_id = client_id.decode()
+        client_id = None
+        try:
+            with s:
+                client_type, client_id = (await self.adecrypt(await async_receive(s))).split(SPLIT_TOKEN, 1)
+                client_id = client_id.decode()
 
-            if client_type == b'send':
+                if client_type == b'send':
+                    try:
+                        request_q: asyncio.Queue = asyncio.Queue()
+                    
+                        q: asyncio.Queue = asyncio.Queue()
+                        self.client_queue[client_id] = q
+                        self.client_send_socket[client_id] = s
+
+                        if callable(self.on_open):
+                            await run_as_async(self.on_open, OnOpenInfo(client_id))
+
+                        await async_send(s, self.encrypt(b'ok'))
+
+                        s.setblocking(True)
+                        t = threading.Thread(target=self.handle_requests, args=(client_id, s, q, request_q, asyncio.get_running_loop()), daemon=True)
+                        t.start()
+                        # asyncio.create_task(self.ahandle_requests(s, q, request_q))
+
+                        while (request := await request_q.get()) is not None:
+                            request: ServerRequest
+                            await run_as_async(self.handler, request)
+                    
+                        await q.put(b'close')
+                        deadline = time.time() + CLIENT_TEARDOWN_TIMEOUT
+                        while client_id in self.client_send_socket and time.time() < deadline:
+                            await asyncio.sleep(0.1)
+                    finally:
+                        self.client_queue.pop(client_id, None)
+                        self.client_send_socket.pop(client_id, None)
+                        if callable(self.on_close):
+                            try:
+                                await run_as_async(self.on_close, OnCloseInfo(client_id))
+                            except Exception as e:
+                                print(f'Error in on_close: {e}')
+                                traceback.print_exc()
+                elif client_type == b'receive':
+                    try:
+                        if callable(self.on_open_receive):
+                            await run_as_async(self.on_open_receive, OnOpenInfo(client_id))
+
+                        await async_send(s, await self.aencrypt(b'ok'))
+
+                        t = time.time()
+                        while client_id not in self.client_queue:
+                            await asyncio.sleep(0.1)
+                            if time.time() - t > 60:
+                                raise ValueError('Timeout waiting for client queue')
+                    
+                        q = self.client_queue[client_id]
+
+                        while (data := await q.get()) != b'close':
+                            if data:
+                                await async_send(s, await self.aencrypt(data))
+
+                        await async_send(s, await self.aencrypt(SPLIT_TOKEN.join([b'empty-id', b'__close__'])))
+                    finally:
+                        self.client_queue.pop(client_id, None)
+                        send_socket = self.client_send_socket.pop(client_id, None)
+                        if send_socket is not None:
+                            # The send socket was handed to handle_requests in
+                            # blocking mode; flipping it back here would race that
+                            # thread, so write to it the same blocking way.
+                            try:
+                                await asyncio.to_thread(send, send_socket, self.encrypt(b'__close__'))
+                            except OSError:
+                                pass  # client already gone
+
+                        if callable(self.on_close_receive):
+                            try:
+                                await run_as_async(self.on_close_receive, OnCloseInfo(client_id))
+                            except Exception as e:
+                                print(f'Error in on_close_receive: {e}')
+                                traceback.print_exc()
+                # method, data = receive(s).split(SPLIT_TOKEN)
+        except (ConnectionClosed, OSError) as e:
+            print(f'Client {client_id} disconnected: {e}')
+        finally:
+            if callable(self.on_finally):
                 try:
-                    request_q: asyncio.Queue = asyncio.Queue()
-                    
-                    q: asyncio.Queue = asyncio.Queue()
-                    self.client_queue[client_id] = q
-                    self.client_send_socket[client_id] = s
-
-                    if inspect.iscoroutinefunction(self.on_open):
-                        await self.on_open(OnOpenInfo(client_id))
-                    elif callable(self.on_open):
-                        await asyncio.to_thread(self.on_open, OnOpenInfo(client_id))
-
-                    await async_send(s, self.encrypt(b'ok'))
-
-                    s.setblocking(True)
-                    t = threading.Thread(target=self.handle_requests, args=(client_id, s, q, request_q, asyncio.get_running_loop()), daemon=True)
-                    t.start()
-                    # asyncio.create_task(self.ahandle_requests(s, q, request_q))
-
-                    while (request := await request_q.get()) is not None:
-                        request: ServerRequest
-                        print('handling', request)
-                        # self.handler(request)
-                        if inspect.iscoroutinefunction(self.handler):
-                            await self.handler(request)
-                        else:
-                            await asyncio.to_thread(self.handler, request)
-                    
-                    await q.put(b'close')
-                    while client_id in self.client_send_socket:
-                        await asyncio.sleep(1.0)
-                finally:
-                    if callable(self.on_close):
-                        try:
-                            await run_as_async(self.on_close, OnCloseInfo(client_id))
-                        except Exception as e:
-                            print(f'Error in on_close: {e}')
-                            traceback.print_exc()
-            elif client_type == b'receive':
-                try:
-                    if inspect.iscoroutinefunction(self.on_open_receive):
-                        await self.on_open_receive(OnOpenInfo(client_id))
-                    elif callable(self.on_open_receive):
-                        await asyncio.to_thread(self.on_open_receive, OnOpenInfo(client_id))
-
-                    await async_send(s, await self.aencrypt(b'ok'))
-
-                    t = time.time()
-                    while client_id not in self.client_queue:
-                        await asyncio.sleep(0.1)
-                        if time.time() - t > 60:
-                            raise ValueError('Timeout waiting for client queue')
-                    
-                    q: asyncio.Queue = self.client_queue[client_id]
-
-                    while (data := await q.get()) != b'close':
-                        if data:
-                            await async_send(s, await self.aencrypt(data))
-                    
-                    await async_send(s, await self.aencrypt(SPLIT_TOKEN.join([b'empty-id', b'__close__'])))
-                    
-                    del self.client_queue[client_id]
-                    self.client_send_socket[client_id].setblocking(False)
-                    await async_send(self.client_send_socket[client_id], await self.aencrypt(b'__close__'))
-                    del self.client_send_socket[client_id]
-                    await asyncio.sleep(1.0)
-                finally:
-                    if callable(self.on_close_receive):
-                        try:
-                            await run_as_async(self.on_close_receive, OnCloseInfo(client_id))
-                        except Exception as e:
-                            print(f'Error in on_close_receive: {e}')
-                            traceback.print_exc()
-            # method, data = receive(s).split(SPLIT_TOKEN)
+                    await run_as_async(self.on_finally, OnFinallyInfo(client_id))
+                except Exception as e:
+                    print(f'Error in on_finally: {e}')
+                    traceback.print_exc()
 
 
 def server_handler_example(request: ServerRequest) -> None:
