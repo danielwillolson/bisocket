@@ -1,0 +1,15 @@
+venv
+dist
+cronevents.egg-info
+bisocket.egg-info
+
+build.sh
+build_helper.py
+version.json
+
+bisocket/__pycache__
+bisocket/bisocket/cython/*.c
+bisocket/bisocket/cython/*.so
+
+.idea
+.DS_Store
