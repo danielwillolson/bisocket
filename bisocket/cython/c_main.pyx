@@ -19,7 +19,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.backends import default_backend
 
 
-VERSION = '0.0.7'
+VERSION = '0.0.8'
 END_TOKEN = b'|[-_-]|'
 SPLIT_TOKEN = b'|(---)|'
 SPLIT_TOKEN2 = b'|{***}|'
