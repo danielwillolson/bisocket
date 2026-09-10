@@ -2,6 +2,12 @@ venv
 build
 dist
 bisocket.egg-info
+.eggs
+
+# Snapshot of the version-bumped files, written by build_helper.py so a
+# failed release can be rolled back. Removed on success and on rollback;
+# only survives if the release is killed outright.
+.release-backup
 
 build.sh
 build_helper.py
