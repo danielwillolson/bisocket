@@ -20,7 +20,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.backends import default_backend
 
 
-VERSION = '0.0.9'
+VERSION = '0.0.10'
 END_TOKEN = b'|[-_-]|'
 SPLIT_TOKEN = b'|(---)|'
 SPLIT_TOKEN2 = b'|{***}|'
@@ -628,6 +628,7 @@ class Client:
             on_receive: Callable[[Message], Awaitable[None] | None],
             encryption: str | bool | None = None,
             require_key: bool | None = None,
+            on_connection_lost: Callable[['ConnectionLostInfo'], Awaitable[None] | None] = None,
         ) -> None:
         # Initialize encryption service
         self.client_id = str(uuid.uuid4())
@@ -662,6 +663,20 @@ class Client:
         self._asend_lock = asyncio.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
 
+        # Replies arrive on the receive socket only. If that socket dies, the reader
+        # thread used to end quietly -- nothing raised, nobody told -- while the send
+        # socket stayed healthy, so the caller went on sending requests whose replies
+        # could never arrive and waited out its own timeout on every one of them.
+        #
+        # `connection_lost` is the record of that: set once, by whichever side notices
+        # first, and read by `send`/`asend` so a request into a one-way connection fails
+        # immediately instead of silently.
+        self.on_connection_lost = on_connection_lost
+        self.connection_lost: ConnectionClosed | None = None
+        # Set by close()/aclose() so a deliberate shutdown is not reported as a loss.
+        self._closing = False
+        self._connection_lost_lock = threading.Lock()
+
     def __enter__(self):
         self.open()
         return self
@@ -687,18 +702,90 @@ class Client:
         if self.decrypt(frame) != b'ok':
             raise ConnectionError('unexpected handshake response from server')
 
+    @property
+    def is_connected(self) -> bool:
+        """False once replies can no longer reach this client."""
+        return self.connection_lost is None
+
+    def _mark_connection_lost(self, reason: str, error: BaseException | None = None) -> ConnectionClosed:
+        """Record that replies can no longer arrive, and tell the embedder once.
+
+        Idempotent and safe from any thread: the reader thread, the pump task and
+        `send` can all reach it, and only the first one through fires the callback.
+        A deliberate `close()` sets `_closing` first, so an ordinary shutdown is not
+        reported as a failure.
+        """
+        with self._connection_lost_lock:
+            first = self.connection_lost is None
+
+            if first:
+                self.connection_lost = ConnectionClosed(
+                    f'connection to {self.host}:{self.port} lost: {reason}')
+                if error is not None:
+                    self.connection_lost.__cause__ = error
+
+            lost = self.connection_lost
+
+        if first and not self._closing and callable(self.on_connection_lost):
+            try:
+                run_maybe_async(self.on_connection_lost,
+                                ConnectionLostInfo(self.client_id, reason, error))
+            except Exception as e:
+                print(f'Error in on_connection_lost: {e}')
+                traceback.print_exc()
+
+        return lost
+
+    def _raise_if_connection_lost(self) -> None:
+        """Fail a request that cannot be answered, rather than sending it anyway."""
+        lost = self.connection_lost
+
+        if lost is not None:
+            raise lost
+
+    def _check_request_ack(self, frame: bytes) -> None:
+        """Inspect the per-request ack from the send socket.
+
+        The server acks each request with a plaintext b'ok'. It also uses this socket to
+        announce its own teardown, as an encrypted b'__close__' -- which this used to
+        swallow as though it were the ack, so a server that had dropped the client was
+        indistinguishable from one that had accepted the request.
+        """
+        if frame == b'ok':
+            return
+
+        try:
+            decoded = self.decrypt(frame)
+        except Exception:
+            return  # not something we can interpret; leave the old behaviour alone
+
+        if decoded == b'__close__':
+            raise self._mark_connection_lost('server closed the connection')
+
     def send(self, method: str, data: bytes) -> str:
         # self.ping()
+        self._raise_if_connection_lost()
         request_id = str(uuid.uuid4())
         with self._send_lock:
-            send(self.send_conn, self.encrypt(SPLIT_TOKEN.join([method.encode(), request_id.encode(), data])))
-            receive(self.send_conn)
+            try:
+                send(self.send_conn, self.encrypt(SPLIT_TOKEN.join([method.encode(), request_id.encode(), data])))
+                ack = receive(self.send_conn)
+            except (ConnectionClosed, OSError) as e:
+                raise self._mark_connection_lost('send socket closed', e) from e
+
+            # `close` is the one method whose ack is followed by the server's own
+            # `__close__`; `close()` reads that itself, and _closing keeps the check
+            # below from treating it as a surprise.
+            self._check_request_ack(ack)
         return request_id
     
     def send_obj(self, method: str, data: dict | list | int | float | bool | str | None) -> str:
         return self.send(method, json.dumps(data).encode())
 
     def __receive_thread(self) -> None:
+        # Every exit from this loop means no further reply will be delivered, so each one
+        # records the loss rather than just ending. `None` is the sentinel from
+        # `_receive_thread`, which has already recorded its own reason.
         while (data := self.receive_queue.get()) is not None:
             try:
                 if not data:
@@ -709,28 +796,37 @@ class Client:
                 request_id, data = self.decrypt(data).split(SPLIT_TOKEN, 1)
 
                 if data == b'__close__':
+                    self._mark_connection_lost('server closed the connection')
                     break
 
                 run_maybe_async(self.on_receive, Message(request_id.decode(), data))
             except Exception as e:
                 print(f'Error handling received data: {e}')
                 traceback.print_exc()
+                self._mark_connection_lost('receive pump stopped', e)
                 break
     
     def _receive_thread(self) -> None:
         while self.receiving:
             try:
                 data = receive(self.receive_conn)
-            except (ConnectionClosed, OSError):
-                # Peer hung up. Stop, rather than spinning on a dead socket.
+            except (ConnectionClosed, OSError) as e:
+                # Peer hung up. Stop, rather than spinning on a dead socket -- and say
+                # so, or the caller goes on sending requests nothing can answer.
+                self._mark_connection_lost('receive socket closed', e)
                 break
             except Exception as e:
                 print(f'Error receiving data: {e}')
                 traceback.print_exc()
+                self._mark_connection_lost('receive socket failed', e)
                 break
 
             if data:
                 self.receive_queue.put(data)
+        else:
+            # `self.receiving` went false without an error: close() is tearing us down,
+            # and `_closing` keeps `_mark_connection_lost` quiet about it.
+            self._mark_connection_lost('receive loop stopped')
         self.receive_queue.put(None)
 
     @staticmethod
@@ -777,9 +873,17 @@ class Client:
         self._check_handshake_ack(receive(self.send_conn))
 
     def close(self) -> None:
+        # Before anything else: this is a deliberate shutdown, so the reader threads
+        # noticing the socket go away must not fire `on_connection_lost`.
+        self._closing = True
         try:
             self.send('close', b'closing')
             assert self.decrypt(self.server_receive(self.send_conn)) == b'__close__'
+        except ConnectionClosed:
+            # Already gone -- there is nobody to say goodbye to. Tearing down is still
+            # the right thing to do, and a caller closing a dead client should not have
+            # to catch anything.
+            pass
         finally:
             self.receiving = False
 
@@ -827,16 +931,24 @@ class Client:
 
     async def asend(self, method: str, data: bytes) -> str:
         # await self.aping()
+        self._raise_if_connection_lost()
         request_id = str(uuid.uuid4())
         async with self._asend_lock:
-            await async_send(self.send_conn, await self.aencrypt(SPLIT_TOKEN.join([method.encode(), request_id.encode(), data])))
-            await async_receive(self.send_conn)
+            try:
+                await async_send(self.send_conn, await self.aencrypt(SPLIT_TOKEN.join([method.encode(), request_id.encode(), data])))
+                ack = await async_receive(self.send_conn)
+            except (ConnectionClosed, OSError) as e:
+                raise self._mark_connection_lost('send socket closed', e) from e
+
+            self._check_request_ack(ack)
         return request_id
     
     async def asend_obj(self, method: str, data: dict | list | int | float | bool | str | None) -> str:
         return await self.asend(method, json.dumps(data).encode())
 
     async def __areceive_thread(self) -> None:
+        # See `__receive_thread`: every exit means replies have stopped, so every exit
+        # records it.
         while (data := await self.areceive_queue.get()) is not None:
             try:
                 if not data:
@@ -845,12 +957,14 @@ class Client:
                 request_id, data = (await self.adecrypt(data)).split(SPLIT_TOKEN, 1)
 
                 if data == b'__close__':
+                    self._mark_connection_lost('server closed the connection')
                     break
 
                 await run_as_async(self.on_receive, Message(request_id.decode(), data))
             except Exception as e:
                 print(f'Error handling received data: {e}')
                 traceback.print_exc()
+                self._mark_connection_lost('receive pump stopped', e)
                 break
     
     def _areceive_thread(self) -> None:
@@ -865,15 +979,24 @@ class Client:
         while self.receiving:
             try:
                 data = receive(self.receive_conn)
-            except (ConnectionClosed, OSError):
+            except (ConnectionClosed, OSError) as e:
+                # The socket died under us. This used to end the thread in silence: the
+                # send socket stayed healthy, so the caller kept sending requests whose
+                # replies could no longer be delivered, and waited out its full timeout
+                # on every one of them.
+                self._mark_connection_lost('receive socket closed', e)
                 break
             except Exception as e:
                 print(f'Error receiving data: {e}')
                 traceback.print_exc()
+                self._mark_connection_lost('receive socket failed', e)
                 break
 
             if data:
                 put(data)
+        else:
+            # Left the loop because `receiving` went false -- i.e. aclose().
+            self._mark_connection_lost('receive loop stopped')
         put(None)
 
     @staticmethod
@@ -931,9 +1054,12 @@ class Client:
         await self._acheck_handshake_ack(await async_receive(self.send_conn))
 
     async def aclose(self) -> None:
+        self._closing = True
         try:
             await self.asend('close', b'closing')
             assert (await self.adecrypt(await self.aserver_receive(self.send_conn))) == b'__close__'
+        except ConnectionClosed:
+            pass  # see `close`
         finally:
             self.receiving = False
             shutdown_socket(self.receive_conn)
@@ -1023,6 +1149,16 @@ class OnCloseInfo:
 class OnFinallyInfo:
     client_id: str | None
     connection_type: str | None = None
+
+
+# The payload for `Client(on_connection_lost=...)`. `reason` is a short phrase for a log
+# line ('receive socket closed', 'server closed the connection'); `error` is the
+# underlying exception when there was one, and None when the peer hung up cleanly.
+@dataclass
+class ConnectionLostInfo:
+    client_id: str
+    reason: str
+    error: BaseException | None = None
 
 
 class Server:

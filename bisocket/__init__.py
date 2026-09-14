@@ -19,6 +19,7 @@ server_handler_example = main.server_handler_example
 OnOpenInfo = main.OnOpenInfo
 OnCloseInfo = main.OnCloseInfo
 OnFinallyInfo = main.OnFinallyInfo
+ConnectionLostInfo = main.ConnectionLostInfo
 
 ConnectionClosed = main.ConnectionClosed
 EncryptionMismatch = main.EncryptionMismatch
@@ -50,7 +51,7 @@ __all__ = [
     'main',
     'Client', 'Server', 'Message', 'ServerRequest', 'server_handler_example',
     'BiClient', 'BiServer', 'BiMessage', 'BiServerRequest',
-    'OnOpenInfo', 'OnCloseInfo', 'OnFinallyInfo',
+    'OnOpenInfo', 'OnCloseInfo', 'OnFinallyInfo', 'ConnectionLostInfo',
     'ConnectionClosed', 'EncryptionMismatch', 'MissingCryptoKey',
     'HandlerError', 'HandlerErrorInfo',
     'CONNECTION_SEND', 'CONNECTION_RECEIVE', 'CONNECTION_TYPES',

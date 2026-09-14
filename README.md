@@ -177,13 +177,16 @@ if __name__ == "__main__":
 
 ## 📚 API Reference
 
-### `Client(host, port, on_receive, encryption=None, require_key=None)`
+### `Client(host, port, on_receive, encryption=None, require_key=None, on_connection_lost=None)`
 
 `on_receive` is called with a `Message` for every message pushed by the server. It
 may be a normal function or an `async def` coroutine function.
 
 `encryption` selects the wire format -- see [Encryption Modes](#-encryption-modes).
 `require_key` is described under [Requiring a key](#requiring-a-key).
+
+`on_connection_lost` is called once, with a `ConnectionLostInfo`, if the connection
+fails -- see [When the connection drops](#when-the-connection-drops).
 
 | Method | Description |
 | --- | --- |
@@ -193,9 +196,40 @@ may be a normal function or an `async def` coroutine function.
 | `send_obj(method, obj) -> str` | Same, but JSON-encodes `obj` first. |
 | `asend(...)` / `asend_obj(...)` | Async equivalents. |
 | `ping()` / `aping()` | Raise `ConnectionError` if either socket has dropped. |
+| `is_connected: bool` | False once replies can no longer arrive. |
+| `connection_lost` | The `ConnectionClosed` describing the failure, or `None`. |
 
 `send()` and `asend()` are safe to call concurrently from multiple threads or tasks;
 each call holds the send socket until its acknowledgement returns.
+
+### When the connection drops
+
+A client holds **two** sockets: requests go out on the send socket, replies come back on
+the receive socket. They can fail independently, and losing the receive socket is the
+dangerous one -- the send socket still works, so requests still appear to be sent, but no
+reply can ever be delivered for them.
+
+A client notices this and says so, rather than going quiet:
+
+```python
+def on_lost(info):
+    # info.client_id, info.reason ('receive socket closed'), info.error (or None)
+    print(f'lost the hub: {info.reason}')
+    # Reconnect, or exit and let your supervisor restart you.
+
+client = Client('10.0.0.2', 65432, on_receive, on_connection_lost=on_lost)
+```
+
+* `on_connection_lost` fires **once**, on the first failure noticed, from whichever side
+  noticed it. It does **not** fire for an ordinary `close()` / `aclose()`.
+* `client.is_connected` goes False, and `client.connection_lost` holds the
+  `ConnectionClosed` that describes it.
+* `send()` / `asend()` then raise that `ConnectionClosed` immediately, instead of writing
+  into a connection whose answers cannot come back.
+* `close()` / `aclose()` on an already-dead client do not raise.
+
+There is no automatic reconnect: a client cannot know whether your application can safely
+replay whatever was in flight. Reconnecting means constructing a new `Client`.
 
 ### `Message`
 
@@ -351,7 +385,7 @@ produces an error reply.
 
 | Exception | Raised when |
 | --- | --- |
-| `ConnectionClosed` | The peer went away mid-frame. Subclasses `ConnectionError`. |
+| `ConnectionClosed` | The peer went away mid-frame, or the connection has been lost -- see [When the connection drops](#when-the-connection-drops). Subclasses `ConnectionError`. |
 | `EncryptionMismatch` | A frame could not be read under this peer's mode. Subclasses `ValueError`. |
 | `MissingCryptoKey` | `require_key` is on and `CRYPTO_KEY` is unset. Subclasses `RuntimeError`. |
 | `HandlerError` | Raised by `Message.raise_for_error()`. Carries `.info`. |
