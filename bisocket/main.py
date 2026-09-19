@@ -9,9 +9,11 @@ import socket
 import inspect
 import asyncio
 import weakref
+import functools
 import traceback
 import threading
 import queue
+import concurrent.futures
 from typing import Callable, Awaitable, Any
 from dataclasses import dataclass
 
@@ -20,7 +22,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.backends import default_backend
 
 
-VERSION = '0.0.10'
+VERSION = '0.0.11'
 END_TOKEN = b'|[-_-]|'
 SPLIT_TOKEN = b'|(---)|'
 SPLIT_TOKEN2 = b'|{***}|'
@@ -43,6 +45,23 @@ RECV_SIZE = 65536
 CLIENT_TEARDOWN_TIMEOUT = 30.0
 DEFAULT_CRYPTO_KEY = 'secret-lol'
 SHUTDOWN_TIMEOUT = 5.0
+
+# Work bisocket itself has to run in a thread: socket setup, an embedder's
+# non-coroutine callback, the reader-thread join at shutdown. It gets a pool of its
+# own on purpose. `asyncio.to_thread` runs on the loop's *default* executor, which
+# belongs to the application, and an application that fills that pool with its own
+# blocking work would otherwise stop this library from delivering a single reply or
+# finishing a close -- over a socket that is healthy the whole time.
+INTERNAL_THREADS = int(os.environ.get('BISOCKET_INTERNAL_THREADS') or 0) or min(32, (os.cpu_count() or 1) + 4)
+
+# Longest a deliberate close() spends saying goodbye to a peer that may never answer.
+GOODBYE_TIMEOUT = 5.0
+
+# TCP keepalive. A peer that vanishes without a FIN leaves a socket that will never
+# produce another byte and never reports an error; these make the kernel find out.
+KEEPALIVE_IDLE = 60
+KEEPALIVE_INTERVAL = 15
+KEEPALIVE_COUNT = 4
 
 # AES-GCM nonce length. Fixed, so the 'faster' wire format can put the nonce at a
 # known offset instead of paying for a delimiter that random bytes might contain.
@@ -279,6 +298,61 @@ def resolve_encryption(mode: 'str | bool | None' = None) -> str:
 
 def send(conn: socket.socket, data: bytes) -> None:
     conn.sendall(data+END_TOKEN)
+
+
+_internal_executor: 'concurrent.futures.ThreadPoolExecutor | None' = None
+_internal_executor_lock = threading.Lock()
+
+
+def internal_executor() -> 'concurrent.futures.ThreadPoolExecutor':
+    """The pool bisocket runs its own blocking work on, created on first use."""
+    global _internal_executor
+
+    with _internal_executor_lock:
+        if _internal_executor is None:
+            _internal_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=INTERNAL_THREADS,
+                thread_name_prefix='bisocket',
+            )
+
+        return _internal_executor
+
+
+async def to_internal_thread(func, *args, **kwargs) -> Any:
+    """`asyncio.to_thread`, but on bisocket's pool rather than the embedder's.
+
+    See INTERNAL_THREADS for why that distinction is the whole point.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(internal_executor(), functools.partial(func, *args, **kwargs))
+
+
+def enable_keepalive(sock: 'socket.socket | None') -> None:
+    """Turn on TCP keepalive, and tune it where the platform allows.
+
+    Best effort throughout: the per-socket knobs are platform specific (macOS has no
+    TCP_KEEPIDLE), and a missing one only means the system default applies.
+    """
+    if sock is None:
+        return
+
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        return
+
+    for name, value in (('TCP_KEEPIDLE', KEEPALIVE_IDLE),
+                        ('TCP_KEEPINTVL', KEEPALIVE_INTERVAL),
+                        ('TCP_KEEPCNT', KEEPALIVE_COUNT)):
+        option = getattr(socket, name, None)
+
+        if option is None:
+            continue
+
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, option, value)
+        except OSError:
+            pass
 
 
 async def async_receive(sock: socket.socket) -> bytes:
@@ -853,6 +927,7 @@ class Client:
 
         self.receive_conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.receive_conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        enable_keepalive(self.receive_conn)
         self.receive_conn.connect((self.host, self.port))
 
         send(self.receive_conn, self.encrypt(SPLIT_TOKEN.join([b'receive', self.client_id.encode()])))
@@ -867,19 +942,44 @@ class Client:
 
         self.send_conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.send_conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        enable_keepalive(self.send_conn)
         self.send_conn.connect((self.host, self.port))
 
         send(self.send_conn, self.encrypt(SPLIT_TOKEN.join([b'send', self.client_id.encode()])))
         self._check_handshake_ack(receive(self.send_conn))
+
+    def _say_goodbye(self) -> None:
+        """Tell the server we are leaving, under a deadline.
+
+        The goodbye is a courtesy, and it must never be the reason a shutdown hangs.
+        A peer that is gone but has not sent a FIN -- a half-open connection, a server
+        whose handler thread died -- takes the write and then never answers, and the
+        blocking read below would have waited on it for good.
+        """
+        previous = self.send_conn.gettimeout() if self.send_conn is not None else None
+
+        try:
+            if self.send_conn is not None:
+                self.send_conn.settimeout(GOODBYE_TIMEOUT)
+
+            self.send('close', b'closing')
+
+            if self.decrypt(self.server_receive(self.send_conn)) != b'__close__':
+                raise ConnectionClosed('server did not acknowledge the close')
+        finally:
+            if self.send_conn is not None:
+                try:
+                    self.send_conn.settimeout(previous)
+                except OSError:
+                    pass
 
     def close(self) -> None:
         # Before anything else: this is a deliberate shutdown, so the reader threads
         # noticing the socket go away must not fire `on_connection_lost`.
         self._closing = True
         try:
-            self.send('close', b'closing')
-            assert self.decrypt(self.server_receive(self.send_conn)) == b'__close__'
-        except ConnectionClosed:
+            self._say_goodbye()
+        except (ConnectionClosed, OSError):
             # Already gone -- there is nobody to say goodbye to. Tearing down is still
             # the right thing to do, and a caller closing a dead client should not have
             # to catch anything.
@@ -888,8 +988,11 @@ class Client:
             self.receiving = False
 
             # The reader thread is parked in a blocking recv(); shut the socket
-            # down so it returns instead of the join() below hanging on it.
+            # down so it returns instead of the join() below hanging on it. The send
+            # socket gets the same treatment: a concurrent `send` waiting on an ack
+            # that is no longer coming has to be let go too.
             shutdown_socket(self.receive_conn)
+            shutdown_socket(self.send_conn)
 
             for thread in (self.receiving_thread, self._receiving_thread):
                 if thread:
@@ -917,12 +1020,12 @@ class Client:
         # running it inline; for the other modes the hop is pure overhead.
         if not self.codec.offload:
             return self.codec.encode(data)
-        return await asyncio.to_thread(self.encrypt, data)
+        return await to_internal_thread(self.encrypt, data)
 
     async def adecrypt(self, data: bytes) -> bytes:
         if not self.codec.offload:
             return self.codec.decode(data)
-        return await asyncio.to_thread(self.decrypt, data)
+        return await to_internal_thread(self.decrypt, data)
 
     async def _acheck_handshake_ack(self, frame: bytes) -> None:
         check_handshake_error(frame, self.encryption)
@@ -1016,7 +1119,7 @@ class Client:
             return False
     
     async def aping(self):
-        if not (await self.ais_socket_healthy(self.send_conn)) or not (await asyncio.to_thread(self.is_socket_healthy, self.receive_conn)):
+        if not (await self.ais_socket_healthy(self.send_conn)) or not (await to_internal_thread(self.is_socket_healthy, self.receive_conn)):
             raise ConnectionError('Connection lost')
     
     async def aopen(self) -> None:
@@ -1027,6 +1130,7 @@ class Client:
             self.receive_conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             # self.receive_conn.setblocking(False)
             self.receive_conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            enable_keepalive(self.receive_conn)
             # await loop.sock_connect(self.receive_conn, (self.host, self.port))
             self.receive_conn.connect((self.host, self.port))
 
@@ -1035,7 +1139,7 @@ class Client:
             send(self.receive_conn, self.encrypt(SPLIT_TOKEN.join([b'receive', self.client_id.encode()])))
             self._check_handshake_ack(receive(self.receive_conn))
         
-        await asyncio.to_thread(receive_socket_setup)
+        await to_internal_thread(receive_socket_setup)
 
         # Start the receive thread
         self.receiving = True
@@ -1047,27 +1151,38 @@ class Client:
         self.send_conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.send_conn.setblocking(False)
         self.send_conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        enable_keepalive(self.send_conn)
         await loop.sock_connect(self.send_conn, (self.host, self.port))
         # self.send_conn.connect((self.host, self.port))
 
         await async_send(self.send_conn, await self.aencrypt(SPLIT_TOKEN.join([b'send', self.client_id.encode()])))
         await self._acheck_handshake_ack(await async_receive(self.send_conn))
 
+    async def _asay_goodbye(self) -> None:
+        await self.asend('close', b'closing')
+
+        if (await self.adecrypt(await self.aserver_receive(self.send_conn))) != b'__close__':
+            raise ConnectionClosed('server did not acknowledge the close')
+
     async def aclose(self) -> None:
         self._closing = True
         try:
-            await self.asend('close', b'closing')
-            assert (await self.adecrypt(await self.aserver_receive(self.send_conn))) == b'__close__'
-        except ConnectionClosed:
+            # Under a deadline, for the reason spelled out in `_say_goodbye`: this
+            # await is the last thing standing between a caller and a finished
+            # shutdown, and a peer that never answers must not be able to hold it
+            # open forever.
+            await asyncio.wait_for(self._asay_goodbye(), GOODBYE_TIMEOUT)
+        except (ConnectionClosed, OSError, asyncio.TimeoutError, TimeoutError):
             pass  # see `close`
         finally:
             self.receiving = False
             shutdown_socket(self.receive_conn)
+            shutdown_socket(self.send_conn)
 
             if self.receiving_task:
                 # join() in a worker thread; blocking it here would stop the
                 # loop that the reader thread needs in order to finish.
-                await asyncio.to_thread(self.receiving_task.join, SHUTDOWN_TIMEOUT)
+                await to_internal_thread(self.receiving_task.join, SHUTDOWN_TIMEOUT)
                 self.receiving_task = None
 
             if self._receiving_task:
@@ -1087,9 +1202,13 @@ class Client:
 
 
 async def run_as_async(func, *args, **kwargs) -> Any:
+    # `to_internal_thread`, not `asyncio.to_thread`: this is how every received
+    # message reaches a non-coroutine `on_receive`, so running it on the
+    # application's default executor means an application that fills that executor
+    # stops seeing replies. See INTERNAL_THREADS.
     if inspect.iscoroutinefunction(func):
         return await func(*args, **kwargs)
-    return await asyncio.to_thread(func, *args, **kwargs)
+    return await to_internal_thread(func, *args, **kwargs)
 
 
 def run_maybe_async(func, *args, **kwargs) -> Any:
@@ -1283,6 +1402,7 @@ class Server:
 
             while True:
                 client_socket, addr = server.accept()
+                enable_keepalive(client_socket)
                 print(f"Connection from {addr}")
                 client_thread = threading.Thread(target=self.handle_client, args=(client_socket,), daemon=True)
                 client_thread.start()
@@ -1472,12 +1592,12 @@ class Server:
         # See Client.aencrypt: the thread hop only pays for itself under 'secure'.
         if not self.codec.offload:
             return self.codec.encode(data)
-        return await asyncio.to_thread(self.encrypt, data)
+        return await to_internal_thread(self.encrypt, data)
 
     async def adecrypt(self, data: bytes) -> bytes:
         if not self.codec.offload:
             return self.codec.decode(data)
-        return await asyncio.to_thread(self.decrypt, data)
+        return await to_internal_thread(self.decrypt, data)
 
     async def astart(self):
         loop = asyncio.get_running_loop()
@@ -1503,6 +1623,7 @@ class Server:
 
             while True:
                 client_socket, addr = await loop.sock_accept(server)  # server.accept()
+                enable_keepalive(client_socket)
                 print(f"Connection from {addr}")
                 # client_thread = threading.Thread(target=self.ahandle_client, args=(client_socket,), daemon=True)
                 # client_thread.start()
@@ -1544,7 +1665,7 @@ class Server:
                 try:
                     frame = await async_receive(s)
                     if self.codec.offload:
-                        client_type, client_id = await asyncio.to_thread(self._parse_handshake, frame)
+                        client_type, client_id = await to_internal_thread(self._parse_handshake, frame)
                     else:
                         client_type, client_id = self._parse_handshake(frame)
                 except EncryptionMismatch as e:
@@ -1624,7 +1745,7 @@ class Server:
                             # blocking mode; flipping it back here would race that
                             # thread, so write to it the same blocking way.
                             try:
-                                await asyncio.to_thread(send, send_socket, self.encrypt(b'__close__'))
+                                await to_internal_thread(send, send_socket, self.encrypt(b'__close__'))
                             except OSError:
                                 pass  # client already gone
 

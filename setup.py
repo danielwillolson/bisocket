@@ -3,7 +3,7 @@ import os
 from setuptools import setup, find_packages, Extension
 from setuptools.command.build_ext import build_ext
 
-VERSION = "0.0.10"
+VERSION = "0.0.11"
 
 # bisocket/cython/c_main.pyx is generated from bisocket/main.py by build_helper.py,
 # so the two can never drift apart. The extension is an optional speed-up: if
